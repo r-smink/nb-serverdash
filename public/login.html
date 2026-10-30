@@ -10,8 +10,14 @@
 <body class="login-page">
   <form id="login" class="login-box">
     <div class="brand"><span class="logo"></span>ServerDash</div>
-    <label>Gebruikersnaam<input name="username" autocomplete="username" required autofocus></label>
-    <label>Wachtwoord<input name="password" type="password" autocomplete="current-password" required></label>
+    <div id="step1">
+      <label>Gebruikersnaam<input name="username" autocomplete="username" required autofocus></label>
+      <label style="margin-top:14px">Wachtwoord<input name="password" type="password" autocomplete="current-password" required></label>
+    </div>
+    <div id="step2" class="hidden">
+      <p class="note">Voer de 6-cijferige code uit je authenticator-app in.</p>
+      <label>Verificatiecode<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7"></label>
+    </div>
     <div id="err" class="form-error"></div>
     <button class="btn" type="submit">Inloggen</button>
   </form>

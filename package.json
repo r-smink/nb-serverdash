@@ -13,6 +13,8 @@
     "demo:clean": "node --disable-warning=ExperimentalWarning scripts/simulate.js --clean"
   },
   "dependencies": {
+    "nodemailer": "^10.3.1",
+    "qrcode": "^1.5.4",
     "uplot": "^1.6.32"
   }
 }

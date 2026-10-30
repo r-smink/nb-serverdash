@@ -18,7 +18,10 @@ export const config = {
   publicUrl: (process.env.PUBLIC_URL || '').replace(/\/+$/, ''),
   trustProxy: process.env.TRUST_PROXY === '1',
   secureCookie: process.env.SECURE_COOKIE === '1',
-  retentionDays: int(process.env.RETENTION_DAYS, 30),
+  // Data ouder dan compactAfterDays wordt samengevat tot uurgemiddelden en retentionDays bewaard.
+  retentionDays: int(process.env.RETENTION_DAYS, 365),
+  compactAfterDays: int(process.env.COMPACT_AFTER_DAYS, 7),
+  resetAdminPassword: process.env.RESET_ADMIN_PASSWORD === '1',
   procSnapshotInterval: int(process.env.PROC_SNAPSHOT_INTERVAL, 60),
   procRetentionHours: int(process.env.PROC_RETENTION_HOURS, 72),
 };

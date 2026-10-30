@@ -9,6 +9,7 @@ import { config } from '../server/config.js';
 import * as store from '../server/db.js';
 
 const DOMAIN = '.demo.local';
+const T0 = Math.floor(Date.now() / 1000);
 const BASE = process.env.SIM_URL || `http://127.0.0.1:${config.port}`;
 const LIVE_INTERVAL = 10;
 
@@ -34,7 +35,10 @@ fleet.push({ name: 'db01', type: 'database', cores: 16, mem: 128 * GB, disk: 200
 const scenario = {
   web07: { cpuBoost: 75 },                          // continu hoge CPU -> kritiek
   web04: { loadBoost: 2.2 },                        // hoge load -> waarschuwing
-  web13: { diskPct: 91 },                           // schijf bijna vol -> waarschuwing
+  web13: { diskPct: 91, diskGrowth: 1.1 },          // schijf groeit snel -> vol over ~8 dagen
+  web15: { backupFailed: true },                    // laatste back-up mislukt -> kritiek
+  web09: { backupAgeH: 31 },                        // back-up te oud -> waarschuwing
+  web02: { attacked: true },                        // veel wp-login/xmlrpc-aanvallen
   web19: { offline: true },                         // offline -> kritiek
   web21: { failed: 'fail2ban' },                    // service down -> kritiek
   web11: { mailq: 1200 },                           // mailwachtrij -> waarschuwing
@@ -122,7 +126,7 @@ function genPayload(srv, seed, t) {
   const load1 = clamp((cpu / 100) * srv.cores * (1 + 0.3 * noise(seed + 3, t, 120)) + (iowait / 100) * srv.cores + (sc.loadBoost || 0) * srv.cores * (0.8 + 0.2 * noise(seed, t, 60)), 0.01, 999);
   const memPct = clamp(45 + (seed * 7) % 30 + 8 * noise(seed + 11, t, 3600), 5, 99);
   const memUsed = (srv.mem * memPct) / 100;
-  const diskBase = sc.diskPct ?? 30 + (seed * 11) % 45;
+  const diskBase = sc.diskPct != null ? sc.diskPct - (sc.diskGrowth || 0) * (T0 - t) / 86400 : 30 + (seed * 11) % 45;
   const diskPct = clamp(diskBase + (t % 86400) / 86400 * 0.5, 1, 99.9);
   const swapPct = clamp(memPct > 80 ? 20 : 2 + 3 * noise(seed + 12, t, 3600), 0, 100);
 
@@ -152,6 +156,10 @@ function genPayload(srv, seed, t) {
     services,
     failed: sc.failed ? [`${sc.failed}.service`] : [],
     mailq: srv.type === 'plesk' ? Math.round((sc.mailq || 5) * (0.8 + 0.4 * noise(seed + 40, t, 600))) : null,
+    dt: LIVE_INTERVAL,
+    security: genSecurity(srv, seed, t, LIVE_INTERVAL),
+    usage: { domains: genDomainUsage(srv, seed, t, LIVE_INTERVAL) },
+    mysql: genMysql(srv, seed, t),
   };
 }
 
@@ -200,6 +208,101 @@ function genSiteStats(site, seed, t, srvName) {
   };
 }
 
+// ---------- extra demo-data (agent 1.2) ----------
+
+const subsFor = (srv, seed) => (srv.type === 'plesk' ? SUBSCRIPTIONS.slice(seed % 5, (seed % 5) + 6) : []);
+const domainsFor = (srv, seed) => [...new Set([...subsFor(srv, seed).map((u) => `${u}.nl`), ...DEMO_SITES.filter((d) => d.server === srv.name).map((d) => d.domain)])];
+
+function genSecurity(srv, seed, t, dt) {
+  const sc = scenario[srv.name] || {};
+  const k = dt / 60;
+  const wave = noise(seed + 70, t, 1800);
+  const attack = srv.type === 'plesk' ? (sc.attacked ? 90 : 6) * wave * k : 0;
+  return {
+    ssh_fail: Math.round((srv.type === 'nameserver' ? 3 : 1.5) * noise(seed + 71, t, 600) * k * 2),
+    wpl: Math.round(attack), xml: Math.round(attack * (sc.attacked ? 1.6 : 0.4)),
+    modsec: Math.round((srv.type === 'plesk' ? 1.2 : 0) * noise(seed + 72, t, 900) * k * 2),
+    f2b: srv.type === 'nameserver' ? { jails: [{ name: 'ssh', banned: 4, total: 310 }], banned: 4 } : {
+      jails: [
+        { name: 'plesk-apache', banned: Math.round(5 + 10 * wave), total: 900 + seed * 13 },
+        { name: 'plesk-wordpress', banned: Math.round((sc.attacked ? 60 : 4) * wave), total: (sc.attacked ? 6000 : 300) + seed },
+        { name: 'plesk-postfix', banned: 2, total: 120 }, { name: 'ssh', banned: 3, total: 400 + seed }, { name: 'recidive', banned: 1, total: 20 },
+      ],
+      get banned() { return this.jails.reduce((a, j) => a + j.banned, 0); },
+    },
+  };
+}
+
+function genDomainUsage(srv, seed, t, dt) {
+  const out = {};
+  const k = dt / 60;
+  domainsFor(srv, seed).forEach((d, i) => {
+    const site = DEMO_SITES.find((x) => x.domain === d);
+    const rpm = (site ? site.rpm : 8 + ((seed + i) * 7) % 30) * (0.5 + noise(seed + i, t, 300));
+    const req = Math.round(rpm * k);
+    const att = scenario[srv.name]?.attacked && i < 2 ? Math.round(40 * noise(seed + i + 80, t, 1200) * k) : Math.round(2 * noise(seed + i + 80, t, 1200) * k);
+    out[d] = [req, req * 85000, Math.round(req * (site?.err || 0.003)), att, Math.round(att * 0.8)];
+  });
+  return out;
+}
+
+function genMysql(srv, seed, t) {
+  if (srv.type === 'nameserver') return undefined;
+  const db = srv.type === 'database';
+  const conns = Math.round((db ? 160 : 12) * (0.6 + 0.6 * noise(seed + 90, t, 300)));
+  return {
+    version: '10.11.9-MariaDB-0ubuntu0.24.04.1', conns, running: Math.round(conns * 0.06) + 1,
+    max_conn: db ? 500 : 151, max_used: db ? 342 : 48,
+    qps: Math.round((db ? 1800 : 90) * (0.6 + 0.6 * noise(seed + 91, t, 240)) * 10) / 10,
+    slow: Math.round((db ? 2.5 : 0.1) * noise(seed + 92, t, 600) * 100) / 100,
+    slow_log: 'ON', long_query_time: '2.000000', uptime: 86400 * 30 + (t % 86400), aborted: 12, hit: db ? 99.31 : 99.87,
+    long: db ? [
+      { id: 88123, user: 'wp_webshopxl', db: 'webshopxl_wp', time: 140 + (t % 600), state: 'Sending data', info: "SELECT p.ID, pm.meta_value FROM wp_posts p JOIN wp_postmeta pm ON pm.post_id = p.ID WHERE pm.meta_key = '_price' ORDER BY pm.meta_value+0 DESC" },
+      { id: 88190, user: 'makelaar', db: 'makelaardij_crm', time: 35, state: 'Creating sort index', info: 'SELECT * FROM objecten WHERE plaats LIKE "%dam%" ORDER BY prijs' },
+      { id: 88201, user: 'wp_autobedrijf', db: 'autobedrijf_wp', time: 3, state: 'updating', info: "UPDATE wp_options SET option_value = '...' WHERE option_name = '_transient_timeout_wc_count_comments'" },
+    ] : [],
+    users: db ? [['wp_webshopxl', 48], ['makelaar', 31], ['wp_autobedrijf', 22], ['wp_tandarts', 14], ['root', 1]] : [['admin', 2], ['wp_local', conns - 2]],
+    repl: db ? { io: 'Yes', sql: 'Yes', lag: Math.round(3 * noise(seed + 93, t, 120)), master: 'db00.nextbuzz.lan', error: '' } : null,
+  };
+}
+
+const WP_PLUGINS = [['akismet', '5.3'], ['contact-form-7', '5.8.1'], ['wordpress-seo', '21.0'], ['woocommerce', '8.2.0'], ['elementor', '3.16.0'],
+  ['wordfence', '7.10.0'], ['really-simple-ssl', '7.0.0'], ['updraftplus', '1.23.10'], ['classic-editor', '1.6.3'], ['nextbuzz-maatwerk', '2.1']];
+
+function genExtras(srv, seed, t) {
+  const sc = scenario[srv.name] || {};
+  const lastBackup = Math.floor(t / 86400) * 86400 + 2 * 3600 - (t % 86400 < 2 * 3600 ? 86400 : 0) - (sc.backupAgeH ? sc.backupAgeH * 3600 - 6 * 3600 : 0);
+  const subs = subsFor(srv, seed);
+  const extras = {
+    backups: {
+      checked: t, source: srv.type === 'database' ? 'paths' : 'plesk', count: srv.type === 'database' ? 0 : 7,
+      last: { ts: lastBackup, size: Math.round(srv.disk * 0.12), status: sc.backupFailed ? 'error' : seed % 7 === 0 ? 'warnings' : 'success',
+        name: srv.type === 'database' ? '/backup/nightly/mariabackup.xbstream' : `backup_info_${new Date(lastBackup * 1000).toISOString().slice(2, 16).replace(/\D/g, '')}.xml`,
+        source: srv.type === 'database' ? 'paths' : 'plesk' },
+    },
+    updates: {
+      total: (seed * 7) % 23, security: seed % 4 === 0 ? (seed * 3) % 9 : 0, checked: t,
+      packages: [['openssl', true], ['libssl3', true], ['linux-image-generic', false], ['curl', seed % 2 === 0], ['tzdata', false], ['plesk-php83', false]].slice(0, 2 + (seed % 5)),
+    },
+  };
+  if (srv.type === 'database') {
+    extras.dbs = { checked: t, list: Array.from({ length: 24 }, (_, i) => [`${SUBSCRIPTIONS[i % 12].replace(/-/g, '_')}_${['wp', 'crm', 'shop'][i % 3]}`, Math.round((40 - i * 1.5) * 1.3 ** (8 - (i % 8)) * 1024 ** 2 * 10), i % 5 === 0 ? 300 * 1024 ** 2 : 0, 12 + i * 3]) };
+  }
+  if (srv.type === 'plesk') {
+    extras.domains = domainsFor(srv, seed);
+    extras.user_domains = Object.fromEntries(subs.map((u) => [u, `${u}.nl`]));
+    extras.wordpress = {
+      checked: t,
+      sites: subs.slice(0, 4).map((u, i) => ({
+        domain: `${u}.nl`, path: `${u}.nl/httpdocs`, version: ['6.4.2', '6.6.2', '6.7.1', '6.5.5'][(seed + i) % 4],
+        plugins: WP_PLUGINS.filter((_, j) => (j + seed + i) % 3 !== 0),
+        themes: [['twentytwentyfour', '1.0'], ['astra', '4.6.0']].slice(0, 1 + ((seed + i) % 2)),
+      })),
+    };
+  }
+  return extras;
+}
+
 // ---------- servers aanmaken + historie ----------
 
 const now = store.nowSec();
@@ -213,6 +316,9 @@ for (const [i, srv] of fleet.entries()) {
   } else {
     token = store.regenerateToken(row.id);
   }
+  // TCP-check naar het dashboard zelf laten wijzen (demo-hostnames bestaan niet); web19 krijgt een dichte poort.
+  const reachCfg = { ports: scenario[srv.name]?.offline ? '9' : String(config.port), reachHost: '127.0.0.1', reach: true, backup: { enabled: true, maxAgeHours: 0 } };
+  store.updateServer(row.id, { name: srv.name, hostname: srv.name + DOMAIN, type: srv.type, notes: 'Demo-server', muted: false, config: reachCfg });
   servers.push({ ...srv, id: row.id, token, seed: i + 1 });
 }
 
@@ -229,6 +335,17 @@ for (const s of servers) {
     }
   }
   if (scenario[s.name]?.offline) store.markSeen(s.id, end, JSON.stringify(genPayload(s, s.seed, end)));
+  store.setServerExtra(s.id, genExtras(s, s.seed, end));
+
+  // Verbruik en beveiliging per uur (voor de pagina's Verbruik en Beveiliging)
+  for (let h = Math.floor((now - 7 * 86400) / 3600) * 3600; h <= end; h += 3600) {
+    const t = h + 1800;
+    const procs = genProcs(s, s.seed, t, 40, s.mem * 0.5).users;
+    for (const u of procs) store.addUsage(s.id, h, u.user, (u.cpu / 100) * 3600 * (0.5 + noise(s.seed, t, 7200)), u.rss, (u.rio + u.wio) * 3600);
+    for (const [d, v] of Object.entries(genDomainUsage(s, s.seed, t, 3600))) store.addDomainUsage(s.id, h, d, ...v);
+    const sec = genSecurity(s, s.seed, t, 3600);
+    store.addSecurity(s.id, h, sec.ssh_fail, sec.wpl, sec.xml, sec.modsec, sec.f2b.banned);
+  }
 }
 store.db.exec('COMMIT');
 
@@ -258,11 +375,15 @@ console.log(`${servers.length} demo-servers klaar. Live metingen naar ${BASE} el
 
 // ---------- live ----------
 
+let tickNo = 0;
 async function tick() {
   const t = store.nowSec();
+  const withExtras = tickNo++ % 30 === 0;
   await Promise.all(servers.filter((s) => !scenario[s.name]?.offline).map(async (s) => {
     try {
       const payload = genPayload(s, s.seed, t);
+      if (withExtras) Object.assign(payload, genExtras(s, s.seed, t));
+      payload.security = JSON.parse(JSON.stringify(payload.security));
       // Net als de echte agent: meet de sites die het dashboard in de vorige response noemde.
       if (s.sites?.length) {
         payload.sites = {};

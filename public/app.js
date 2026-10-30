@@ -91,22 +91,56 @@ function resetView() {
   view.cleanup = [];
 }
 
+// Ingelogde gebruiker; viewers krijgen geen beheerknoppen (.admin-only).
+let me = { username: '', role: 'viewer' };
+const isAdmin = () => me.role === 'admin';
+
+const PAGES = [
+  ['#/websites', () => renderWebsites()], ['#/verbruik', () => renderUsage()], ['#/onderhoud', () => renderMaintenance()],
+  ['#/beveiliging', () => renderSecurity()], ['#/incidenten', () => renderIncidents()], ['#/beheer', () => renderAdmin()],
+  ['#/account', () => renderAccount()], ['#/tv', () => renderTv()],
+];
+
 function route() {
   resetView();
   const h = location.hash || '#/';
-  const section = h.startsWith('#/website') ? '#/websites' : h.startsWith('#/beheer') ? '#/beheer' : '#/';
+  document.body.classList.toggle('tv', h.startsWith('#/tv'));
+  const section = h.startsWith('#/website') ? '#/websites' : h.startsWith('#/server') ? '#/'
+    : (PAGES.find(([p]) => h.startsWith(p))?.[0] || '#/');
   $$('.topbar nav a').forEach((a) => a.classList.toggle('active', a.getAttribute('href') === section));
   window.scrollTo(0, 0);
   let m = h.match(/^#\/server\/(\d+)/);
   if (m) return renderDetail(+m[1]);
   m = h.match(/^#\/website\/(\d+)/);
   if (m) return renderWebsite(+m[1]);
-  if (h.startsWith('#/websites')) return renderWebsites();
-  if (h.startsWith('#/beheer')) return renderAdmin();
+  const page = PAGES.find(([p]) => h.startsWith(p));
+  if (page) return page[1]();
   return renderOverview();
 }
 
-window.addEventListener('hashchange', route);
+async function boot() {
+  try {
+    me = (await api('/me')).user;
+  } catch { return; }
+  document.body.classList.toggle('role-viewer', !isAdmin());
+  $('#whoami').textContent = `👤 ${me.username}`;
+  window.addEventListener('hashchange', route);
+  route();
+  updateIncidentBadge();
+  setInterval(updateIncidentBadge, 30_000);
+}
+
+async function updateIncidentBadge() {
+  try {
+    const d = await api('/incidents?open=1');
+    const open = d.incidents.filter((i) => !i.ended);
+    const b = $('#incBadge');
+    b.textContent = open.length;
+    b.classList.toggle('hidden', !open.length);
+    b.classList.toggle('crit', open.some((i) => i.level === 'crit' && !i.ack_ts));
+  } catch { /* volgende keer opnieuw */ }
+}
+
 $('#logout').onclick = async () => {
   await api('/logout', { method: 'POST', body: {} }).catch(() => {});
   location.href = '/login.html';
@@ -170,7 +204,8 @@ function drawOverview() {
     <span class="chip warn ${counts.warn ? 'has' : ''}">${counts.warn} waarschuwing</span>
     <span class="chip ok">${counts.ok} OK</span>
     ${counts.pending ? `<span class="chip">${counts.pending} wachtend</span>` : ''}
-    ${counts.muted ? `<span class="chip">${counts.muted} gepauzeerd</span>` : ''}`;
+    ${counts.muted ? `<span class="chip">${counts.muted} gepauzeerd</span>` : ''}
+    ${d.openIncidents ? `<a class="chip warn has" href="#/incidenten">${d.openIncidents} open incident${d.openIncidents === 1 ? '' : 'en'}</a>` : ''}`;
 
   const q = (prefs.search || '').toLowerCase();
   const f = prefs.filter || 'all';
@@ -267,6 +302,8 @@ const CHART_DEFS = [
   { key: 'net', title: 'Netwerk', y: 'rate', series: [['net_rx', 'Inkomend', C.green, true], ['net_tx', 'Uitgaand', C.blue, true]] },
   { key: 'space', title: 'Schijfruimte', y: 'pct', max: 100, dynamic: true },
   { key: 'procs', title: 'Processen & mailwachtrij', y: 'int', series: [['procs', 'Processen', C.purple, true], ['mailq', 'Mailwachtrij', C.yellow]] },
+  { key: 'db', title: 'Database: verbindingen & queries', y: 'num', optional: true, series: [['db_conns', 'Verbindingen', C.teal, true], ['db_running', 'Actief', C.orange], ['db_qps', 'Queries/s', C.blue], ['db_slow', 'Trage queries/min', C.red]] },
+  { key: 'reach', title: 'Bereikbaarheid (TCP vanaf dashboard)', y: 'ms', optional: true, src: 'reach', series: [['ms', 'Connect-tijd', C.green, true]] },
 ];
 
 const Y_FMT = {
@@ -416,14 +453,23 @@ function renderDetail(id) {
       <div class="chart" id="c-${d.key}"><h4>${d.title}<span></span></h4><div class="plot"></div></div>`).join('')}
     </div>
     <section class="panel" id="procPanel"></section>
+    <section class="panel hidden" id="dbPanel"></section>
     <div class="cols3">
       <section class="panel" id="usersPanel"></section>
       <section class="panel" id="svcPanel"></section>
       <section class="panel" id="diskPanel"></section>
     </div>
+    <div class="cols3">
+      <section class="panel" id="backupPanel"></section>
+      <section class="panel" id="updatePanel"></section>
+      <section class="panel" id="secPanel"></section>
+    </div>
     <div class="cols">
       <section class="panel" id="infoPanel"></section>
-      <section class="panel"><h3>Meldingen</h3><ul class="events compact" id="eventList"></ul></section>
+      <section class="panel">
+        <h3>Incidenten (30 dagen)</h3><ul class="events compact" id="incList"></ul>
+        <h3 style="margin-top:16px">Meldingen</h3><ul class="events compact" id="eventList"></ul>
+      </section>
     </div>`;
 
   $('#ranges').onclick = (e) => {
@@ -492,11 +538,13 @@ function renderDetail(id) {
     if (def.dynamic) {
       return Object.keys(m.disks.mounts).map((mount, i) => [mount, mount, PALETTE[i % PALETTE.length], true]);
     }
-    return def.series.filter(([k]) => k !== 'mailq' || m.series.mailq.some((v) => v));
+    const src = def.src ? m[def.src] : m.series;
+    return def.series.filter(([k]) => (k !== 'mailq' && !def.optional) || (src[k] || []).some((v) => v != null && (k !== 'mailq' || v)));
   }
 
   function dataFor(def, m, series) {
     if (def.dynamic) return [m.disks.ts, ...series.map(([k]) => m.disks.mounts[k])];
+    if (def.src) return [m[def.src].ts, ...series.map(([k]) => m[def.src][k])];
     return [m.series.ts, ...series.map(([k]) => (k === 'cores' ? m.series.ts.map(() => m.cores) : m.series[k]))];
   }
 
@@ -509,7 +557,10 @@ function renderDetail(id) {
     },
     onPick: (ts) => showSnapshot(ts),
   };
-  const drawCharts = (m) => drawChartSet(CHART_DEFS, m, seriesFor, dataFor, chartOpts);
+  const drawCharts = (m) => {
+    for (const def of CHART_DEFS.filter((d) => d.optional)) $(`#c-${def.key}`).classList.toggle('hidden', !seriesFor(def, m).length);
+    drawChartSet(CHART_DEFS, m, seriesFor, dataFor, chartOpts);
+  };
   observeCharts($('#charts'));
 
   async function showSnapshot(ts) {
@@ -605,6 +656,7 @@ function renderDetail(id) {
         <div class="bar ${lvlFor(x.pct, th.disk)}"><i style="width:${Math.min(100, x.pct)}%"></i></div>
         <div class="sub">${esc(x.device)} · ${esc(x.fs)}${x.inodes_pct != null ? ` · inodes ${fmt.pct(x.inodes_pct, 1)}` : ''}</div>
       </div>`).join('') || '<p class="muted">Geen data</p>'}
+      ${forecastHtml(d.forecast)}
       ${p?.diskio ? `<p class="note">I/O nu: lezen ${fmt.rate(p.diskio.read)} (${fmt.int(p.diskio.riops)} IOPS), schrijven ${fmt.rate(p.diskio.write)} (${fmt.int(p.diskio.wiops)} IOPS), utilisatie ${fmt.pct(p.diskio.util)}</p>` : ''}`;
 
     const sys = p?.system || {};
@@ -614,10 +666,12 @@ function renderDetail(id) {
       ['Uptime', sys.uptime != null && fmt.dur(sys.uptime)], ['Load', p?.load?.map((v) => fmt.num(v)).join(' / ')],
       ['Mailwachtrij', p?.mailq != null && fmt.int(p.mailq)], ['Herstart nodig', sys.reboot_required ? 'Ja' : sys.hostname && 'Nee'],
       ['Agent', d.agent], ['Laatst gezien', d.last_seen && `${fmt.time(d.last_seen)} (${fmt.ago(d.last_seen)})`],
+      ['TCP-check', d.reach ? `${d.reach.ok ? `OK, poort ${d.reach.port} in ${d.reach.ms} ms` : `MISLUKT (${d.reach.error || 'geen verbinding'}) op ${d.reach.ports.join(', ')}`} · ${d.reach.host} · ${fmt.ago(d.reach.ts)}`
+        : d.reachTarget ? 'wacht op eerste controle' : 'uit (geen hostname)'],
       ['Notities', d.notes],
     ].filter(([, v]) => v);
     $('#infoPanel').innerHTML = `
-      <div class="panel-head"><h3>Systeeminformatie</h3><div class="right"><a class="btn ghost small" href="#/beheer">Beheren</a></div></div>
+      <div class="panel-head"><h3>Systeeminformatie</h3><div class="right"><a class="btn ghost small admin-only" href="#/beheer">Beheren</a></div></div>
       <dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
       <h3 style="margin-top:18px">Bewaakte websites</h3>
       <div class="site-links">${(d.websites || []).map((w) => `
@@ -625,6 +679,102 @@ function renderDetail(id) {
         || '<span class="muted">Geen — voeg ze toe via <a href="#/websites">Websites</a></span>'}</div>`;
 
     $('#eventList').innerHTML = eventsHtml(d.events, false) || '<li class="muted">Geen meldingen</li>';
+    $('#incList').innerHTML = d.incidents.map((i) => `
+      <li><span class="t">${fmt.time(i.started)}</span><a href="#/incidenten/${i.id}" class="lvl-${i.ended ? 'ok' : i.level}">
+        ${i.ended ? '✓' : '●'} ${esc(i.summary || i.title)} ${i.ended ? `(${fmt.dur(i.ended - i.started)})` : '(open)'}</a></li>`).join('')
+      || '<li class="muted">Geen incidenten</li>';
+
+    drawDbPanel(p?.mysql, d.dbs, d.dbs_ts, th);
+    drawBackupPanel(d);
+    drawUpdatePanel(d, p);
+    drawSecPanel(p?.security);
+  }
+
+  function drawDbPanel(m, dbs, dbsTs, th) {
+    const el = $('#dbPanel');
+    el.classList.toggle('hidden', !m);
+    if (!m) return;
+    if (m.error) { el.innerHTML = `<h3>Database</h3><p class="muted">Kon MySQL/MariaDB niet uitlezen: ${esc(m.error)}</p>`; return; }
+    const connPct = m.max_conn ? (m.conns / m.max_conn) * 100 : null;
+    el.innerHTML = `
+      <div class="panel-head"><h3>Database — ${esc(m.version || 'MySQL/MariaDB')}</h3><span class="muted">uptime ${fmt.dur(m.uptime)}</span></div>
+      <div class="shares">
+        <div class="share"><div class="share-head"><span>Verbindingen</span><b>${m.conns}${m.max_conn ? ` / ${m.max_conn}` : ''}</b></div>
+          <div class="bar ${lvlFor(connPct, th.dbConn)}"><i style="width:${Math.min(100, connPct || 0)}%"></i></div>
+          <small>piek ${m.max_used} · ${m.running} nu bezig</small></div>
+        <div class="share"><div class="share-head"><span>Queries</span><b>${fmt.num(m.qps, 1)}/s</b></div>
+          <small>trage queries: ${fmt.num(m.slow, 2)}/min (slow log ${esc(m.slow_log || '?')}, drempel ${esc(m.long_query_time || '?')} s)</small></div>
+        <div class="share"><div class="share-head"><span>Buffer-pool hit</span><b>${fmt.pct(m.hit, 2)}</b></div>
+          <small>${m.hit < 95 ? 'laag: overweeg een grotere innodb_buffer_pool_size' : 'gezond'}</small></div>
+        <div class="share"><div class="share-head"><span>Replicatie</span><b>${m.repl ? (m.repl.lag != null ? `${m.repl.lag} s` : '?') : '–'}</b></div>
+          <small>${m.repl ? `IO ${esc(m.repl.io)} · SQL ${esc(m.repl.sql)} · master ${esc(m.repl.master || '?')}${m.repl.error ? ` · ${esc(m.repl.error)}` : ''}` : 'geen replicatie ingesteld'}</small></div>
+      </div>
+      <div class="cols" style="gap:24px">
+        <div>
+          <h3 style="margin-top:16px">Lopende queries (langste eerst)</h3>
+          <div class="table-wrap" style="max-height:320px"><table>
+            <thead><tr><th class="num">Tijd</th><th>Gebruiker</th><th>Database</th><th>Status</th><th>Query</th></tr></thead>
+            <tbody>${(m.long || []).map((q) => `<tr>
+              <td class="num ${lvlFor(q.time, th.longQuery) === 'crit' ? 'hot' : lvlFor(q.time, th.longQuery) ? 'warm' : ''}">${fmt.dur(q.time)}</td>
+              <td>${esc(q.user)}</td><td>${esc(q.db)}</td><td>${esc(q.state)}</td>
+              <td class="cmd" title="${esc(q.info)}">${esc(q.info)}</td></tr>`).join('')
+              || '<tr><td colspan="5" class="muted">Geen lopende queries</td></tr>'}</tbody>
+          </table></div>
+        </div>
+        <div>
+          <h3 style="margin-top:16px">Grootste databases ${dbsTs ? `<span class="muted" style="font-weight:400">· ${fmt.ago(dbsTs)}</span>` : ''}</h3>
+          <div class="table-wrap" style="max-height:320px"><table>
+            <thead><tr><th>Database</th><th class="num">Grootte</th><th class="num">Vrij te maken</th><th class="num">Tabellen</th></tr></thead>
+            <tbody>${(dbs?.list || []).map(([n, size, free, tables]) => `<tr><td>${esc(n)}</td><td class="num">${fmt.bytes(size)}</td>
+              <td class="num">${free > 50 * 1024 ** 2 ? fmt.bytes(free) : '–'}</td><td class="num">${tables}</td></tr>`).join('')
+              || '<tr><td colspan="4" class="muted">Nog niet gemeten (elke 6 uur)</td></tr>'}</tbody>
+          </table></div>
+          <h3 style="margin-top:16px">Verbindingen per gebruiker</h3>
+          <div class="site-links">${(m.users || []).map(([u, n]) => `<span class="badge">${esc(u)}: ${n}</span>`).join('') || '<span class="muted">–</span>'}</div>
+        </div>
+      </div>`;
+  }
+
+  function drawBackupPanel(d) {
+    const b = d.backups, cfg = d.config?.backup || {};
+    let body;
+    if (cfg.enabled === false) body = '<p class="muted">Back-upbewaking staat uit voor deze server.</p>';
+    else if (!b) body = '<p class="muted">Nog geen gegevens (agent 1.2+ nodig, controle elke 10 minuten).</p>';
+    else if (!b.last) body = '<p class="lvl-warn">Geen back-up gevonden.</p>';
+    else {
+      const age = Date.now() / 1000 - b.last.ts;
+      const lim = (cfg.maxAgeHours || d.thresholds.backupAge.warn) * 3600;
+      const cls = b.last.status === 'error' || age > lim * 2 ? 'lvl-crit' : age > lim ? 'lvl-warn' : '';
+      body = `<dl class="kv">
+        <dt>Laatste back-up</dt><dd class="${cls}">${fmt.time(b.last.ts)} (${fmt.ago(b.last.ts)})</dd>
+        <dt>Resultaat</dt><dd>${BACKUP_STATUS[b.last.status] || esc(b.last.status)}</dd>
+        <dt>Grootte</dt><dd>${b.last.size ? fmt.bytes(b.last.size) : '–'}</dd>
+        <dt>Bron</dt><dd>${b.last.source === 'paths' ? 'eigen back-upmap' : 'Plesk'} · <span class="muted mono">${esc(b.last.name)}</span></dd>
+        ${b.count ? `<dt>Lokaal aanwezig</dt><dd>${b.count}</dd>` : ''}
+        <dt>Gecontroleerd</dt><dd>${fmt.ago(b.checked)}</dd></dl>`;
+    }
+    $('#backupPanel').innerHTML = `<h3>Back-ups</h3>${body}`;
+  }
+
+  function drawUpdatePanel(d, p) {
+    const u = d.updates;
+    $('#updatePanel').innerHTML = `<h3>Updates</h3>${u ? `
+      <div class="shares" style="grid-template-columns:1fr 1fr">
+        <div class="share"><div class="share-head"><span>Security</span><b class="${u.security ? 'lvl-crit' : ''}">${u.security}</b></div></div>
+        <div class="share"><div class="share-head"><span>Totaal</span><b>${u.total}</b></div></div>
+      </div>
+      <p class="note">${p?.system?.reboot_required ? '⚠ Herstart vereist · ' : ''}Plesk ${esc(p?.system?.plesk || '–')} · gecontroleerd ${fmt.ago(u.checked)}</p>
+      <div class="site-links">${(u.packages || []).slice(0, 30).map(([n, sec]) => `<span class="badge ${sec ? 'sec' : ''}">${esc(n)}</span>`).join('')}</div>`
+      : '<p class="muted">Nog geen gegevens (agent 1.2+ nodig, controle elk uur).</p>'}`;
+  }
+
+  function drawSecPanel(sec) {
+    const f2b = sec?.f2b;
+    $('#secPanel').innerHTML = `<div class="panel-head"><h3>Beveiliging</h3><div class="right"><a class="btn ghost small" href="#/beveiliging">Alle servers</a></div></div>
+      ${f2b ? `<p>Fail2ban blokkeert nu <b>${f2b.banned}</b> IP-adres${f2b.banned === 1 ? '' : 'sen'}.</p>
+        <table><tbody>${f2b.jails.map((j) => `<tr><td>${esc(j.name)}</td><td class="num">${j.banned} nu</td><td class="num muted">${j.total} totaal</td></tr>`).join('')}</tbody></table>`
+        : '<p class="muted">Geen Fail2ban-gegevens.</p>'}
+      ${sec ? `<p class="note">Laatste meting: ${sec.ssh_fail} mislukte SSH-logins, ${sec.wpl} POSTs op wp-login.php, ${sec.xml} op xmlrpc.php, ${sec.modsec} ModSecurity-blokkades.</p>` : ''}`;
   }
 
   loadInfo();
@@ -647,13 +797,17 @@ function renderWebsites() {
       <div class="filters">
         <input id="search" type="search" placeholder="Zoek website…" value="${esc(prefs.siteSearch || '')}">
         <select id="serverFilter" style="width:auto"><option value="">Alle servers</option></select>
-        <button class="btn" id="addSite">+ Website toevoegen</button>
+        <button class="btn ghost admin-only" id="discoverSites">🔎 Ontdekken</button>
+        <button class="btn admin-only" id="addSite">+ Website toevoegen</button>
       </div>
     </div>
     <div class="grid sites" id="grid"><div class="empty">Laden…</div></div>`;
 
   $('#search').oninput = (e) => { prefs.siteSearch = e.target.value; savePrefs(); drawWebsites(); };
   $('#serverFilter').onchange = (e) => { prefs.siteServer = e.target.value; savePrefs(); drawWebsites(); };
+  $('#discoverSites').onclick = async () => {
+    if (await discoverDialog()) loadWebsites(nav);
+  };
   $('#addSite').onclick = async () => {
     if (!websitesData) return;
     if (await websiteForm({}, websitesData.servers)) loadWebsites(nav);
@@ -886,9 +1040,9 @@ function renderWebsite(id) {
         <span class="lvl-label">${LEVEL_LABEL[lvl]}</span>
         <div class="right" style="margin-left:auto;display:flex;gap:8px">
           <a class="btn ghost small" href="${esc(d.url || `https://${d.domain}/`)}" target="_blank" rel="noopener noreferrer">Openen ↗</a>
-          ${d.check_enabled ? '<button class="btn ghost small" id="checkNow">Nu controleren</button>' : ''}
-          <button class="btn ghost small" id="editSite">Bewerken</button>
-          <button class="btn danger small" id="delSite">Verwijderen</button>
+          ${d.check_enabled ? '<button class="btn ghost small admin-only" id="checkNow">Nu controleren</button>' : ''}
+          <button class="btn ghost small admin-only" id="editSite">Bewerken</button>
+          <button class="btn danger small admin-only" id="delSite">Verwijderen</button>
         </div>
       </div>
       <div class="dsub">${[s?.user && `gebruiker ${esc(s.user)}`, s?.docroot && esc(s.docroot), d.stats_ts && `data ${fmt.ago(d.stats_ts)}`].filter(Boolean).join(' · ')}</div>
@@ -995,6 +1149,19 @@ function serverForm(s = {}) {
         </div>
         <label>Hostname / IP<input name="hostname" maxlength="255" value="${esc(s.hostname)}" placeholder="web01.nextbuzz.nl"></label>
         <label>Notities<textarea name="notes" rows="3" maxlength="2000">${esc(s.notes)}</textarea></label>
+        <details ${s.id ? '' : 'open'}><summary>Bereikbaarheid &amp; back-ups</summary>
+          <div class="form" style="margin-top:10px">
+            <div class="row">
+              <label>TCP-poorten (leeg = standaard per type)<input name="ports" value="${esc(s.config?.ports || '')}" placeholder="bijv. 443,8443 of 22"></label>
+              <label>Ander adres voor de TCP-check (optioneel)<input name="reachHost" value="${esc(s.config?.reachHost || '')}" placeholder="bijv. intern IP"></label>
+            </div>
+            <label class="check"><input type="checkbox" name="reach" ${s.config?.reach === false ? '' : 'checked'}> TCP-bereikbaarheid controleren vanaf het dashboard</label>
+            <div class="row">
+              <label class="check" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="backupEnabled" ${s.config?.backup?.enabled === false ? '' : 'checked'}> Back-ups bewaken</label>
+              <label>Back-up max. oud (uren, leeg = standaard)<input type="number" min="0" name="backupMaxAge" value="${s.config?.backup?.maxAgeHours || ''}"></label>
+            </div>
+          </div>
+        </details>
         ${s.id ? `<label class="check"><input type="checkbox" name="muted" ${s.muted ? 'checked' : ''}> Gepauzeerd (onderhoud — geen meldingen, grijs in overzicht)</label>` : ''}
         <div class="form-error"></div>
         <div class="actions">
@@ -1008,6 +1175,10 @@ function serverForm(s = {}) {
       e.preventDefault();
       const data = Object.fromEntries(new FormData(form));
       data.muted = !!data.muted;
+      data.config = {
+        ports: data.ports, reachHost: data.reachHost, reach: !!data.reach,
+        backup: { enabled: !!data.backupEnabled, maxAgeHours: +data.backupMaxAge || 0 },
+      };
       try {
         const res = s.id
           ? await api(`/servers/${s.id}`, { method: 'PUT', body: data })
@@ -1053,10 +1224,15 @@ async function renderAdmin() {
       <div class="panel-head"><h3>Servers</h3><div class="right"><button class="btn" id="addBtn">+ Server toevoegen</button></div></div>
       <div class="table-wrap" id="srvTable"><p class="muted">Laden…</p></div>
     </section>
+    <section class="panel" id="notifyPanel"></section>
     <section class="panel">
-      <h3>Drempelwaarden &amp; meldingen</h3>
+      <h3>Drempelwaarden</h3>
       <form id="thForm" class="form"></form>
-    </section>`;
+    </section>
+    <div class="cols">
+      <section class="panel" id="generalPanel"></section>
+      <section class="panel" id="usersAdmin"></section>
+    </div>`;
 
   $('#addBtn').onclick = async () => {
     const res = await serverForm();
@@ -1120,6 +1296,9 @@ async function renderAdmin() {
       ['disk', 'Schijfruimte', '% per mount'], ['inodes', 'Inodes', '% per mount'], ['mailq', 'Mailwachtrij', 'aantal berichten'],
       ['response', 'Website: responstijd', 'ms'], ['ssl', 'Website: SSL verloopt binnen', 'dagen (lager = slechter)'],
       ['err5xx', 'Website: serverfouten', '% 5xx-responses'], ['siteCpu', 'Website: CPU', '% van één core, gemiddeld'],
+      ['backupAge', 'Back-up ouder dan', 'uren'], ['diskDays', 'Schijf vol binnen', 'dagen bij huidige groei (lager = slechter)'],
+      ['dbConn', 'Database-verbindingen', '% van max_connections'], ['replLag', 'Replicatie-achterstand', 'seconden'],
+      ['longQuery', 'Langlopende query', 'seconden'], ['secUpdates', 'Security-updates', 'aantal (0 = alleen tonen, geen melding)'],
     ];
     const t = s.thresholds;
     $('#thForm').innerHTML = `
@@ -1136,11 +1315,9 @@ async function renderAdmin() {
         <label>Gemiddelde over (minuten) voor CPU, load en IO-wait<input type="number" min="1" max="60" name="sustainMinutes" value="${t.sustainMinutes}"></label>
         <label>Offline na (seconden zonder data)<input type="number" min="60" name="offlineSeconds" value="${t.offlineSeconds}"></label>
       </div>
-      <label>Webhook-URL voor meldingen (Slack, Mattermost, Discord, Teams-workflow…)<input name="webhookUrl" value="${esc(s.webhookUrl)}" placeholder="https://hooks.slack.com/services/…"></label>
       <label class="check"><input type="checkbox" name="enlargeProblems" ${s.enlargeProblems ? 'checked' : ''}> Servers met een kritieke status vergroot tonen in het overzicht</label>
       <div class="form-error" id="thMsg"></div>
       <div class="actions">
-        <button type="button" class="btn ghost" id="testHook">Test webhook</button>
         <button type="button" class="btn ghost" id="thReset">Standaardwaarden</button>
         <button class="btn">Opslaan</button>
       </div>`;
@@ -1151,7 +1328,7 @@ async function renderAdmin() {
       const thresholds = { sustainMinutes: +fd.get('sustainMinutes'), offlineSeconds: +fd.get('offlineSeconds') };
       for (const [k] of rows) thresholds[k] = { warn: +fd.get(`${k}.warn`), crit: +fd.get(`${k}.crit`) };
       try {
-        await api('/settings', { method: 'PUT', body: { thresholds, webhookUrl: fd.get('webhookUrl'), enlargeProblems: fd.get('enlargeProblems') === 'on' } });
+        await api('/settings', { method: 'PUT', body: { thresholds, enlargeProblems: fd.get('enlargeProblems') === 'on' } });
         $('#thMsg').style.color = '#86efac';
         $('#thMsg').textContent = 'Opgeslagen ✓';
       } catch (ex) {
@@ -1164,21 +1341,15 @@ async function renderAdmin() {
       await api('/settings', { method: 'PUT', body: { thresholds: s.defaults } });
       loadSettings();
     };
-    $('#testHook').onclick = async () => {
-      try {
-        await api('/settings/test-webhook', { method: 'POST', body: {} });
-        $('#thMsg').style.color = '#86efac';
-        $('#thMsg').textContent = 'Testmelding verstuurd (sla eerst op als je de URL net hebt gewijzigd)';
-      } catch (ex) { $('#thMsg').style.color = ''; $('#thMsg').textContent = ex.message; }
-    };
+    drawNotifySettings($('#notifyPanel'), s);
+    drawGeneralSettings($('#generalPanel'), s);
   }
 
   try {
-    await Promise.all([loadServers(), loadSettings()]);
+    await Promise.all([loadServers(), loadSettings(), drawUsersAdmin($('#usersAdmin'))]);
     setConn(true);
   } catch (e) {
     setConn(false, e.message);
   }
 }
 
-route();

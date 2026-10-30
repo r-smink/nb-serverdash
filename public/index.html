@@ -14,13 +14,20 @@
     <nav>
       <a href="#/">Overzicht</a>
       <a href="#/websites">Websites</a>
-      <a href="#/beheer">Beheer</a>
+      <a href="#/verbruik">Verbruik</a>
+      <a href="#/onderhoud">Onderhoud</a>
+      <a href="#/beveiliging">Beveiliging</a>
+      <a href="#/incidenten">Incidenten <span id="incBadge" class="nav-badge hidden"></span></a>
+      <a href="#/beheer" class="admin-only">Beheer</a>
     </nav>
     <span id="conn" class="conn"></span>
+    <a href="#/tv" class="btn ghost small" title="Tv-/wandmodus">📺 TV</a>
+    <a href="#/account" class="btn ghost small" id="whoami">Account</a>
     <button id="logout" class="btn ghost small">Uitloggen</button>
   </header>
   <main id="main"></main>
   <script src="/vendor/uPlot.iife.min.js"></script>
   <script src="/app.js"></script>
+  <script src="/pages.js"></script>
 </body>
 </html>

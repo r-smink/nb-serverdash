@@ -2,14 +2,21 @@
 # -*- coding: utf-8 -*-
 """NextBuzz ServerDash agent.
 
-Verzamelt elke <interval> seconden systeemstatistieken uit /proc en systemd en
-stuurt die als JSON naar het dashboard. Geen externe afhankelijkheden; werkt
-met de standaard python3 van Ubuntu 18.04 en nieuwer.
+Verzamelt elke <interval> seconden systeemstatistieken uit /proc, systemd, de
+Plesk-logs en (indien aanwezig) MySQL/MariaDB en stuurt die als JSON naar het
+dashboard. Trage controles (updates, back-ups, WordPress, databasegroottes)
+draaien in een achtergrondthread. Geen externe afhankelijkheden; werkt met de
+standaard python3 van Ubuntu 18.04 en nieuwer.
 
 Gebruik:
   nb-agent.py            draai als service (doorlopend)
   nb-agent.py --once     verzamel en verstuur één meting (test)
-  nb-agent.py --print    verzamel één meting en toon de JSON (niets versturen)
+  nb-agent.py --print    verzamel één meting incl. trage controles en toon de JSON (niets versturen)
+
+Optionele instellingen in /etc/nb-agent.conf:
+  backup_paths=/backup,/srv/dumps     mappen met eigen back-ups (nieuwste bestand telt)
+  mysql_defaults=/root/.my.cnf        inloggegevens voor MySQL/MariaDB
+  wordpress=0                         WordPress-scan uitschakelen
 """
 import collections
 import glob
@@ -27,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 CONF_FILE = os.environ.get('NB_AGENT_CONF', '/etc/nb-agent.conf')
 HZ = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
@@ -45,11 +52,19 @@ MAILQ_DIRS = ['/var/spool/postfix/deferred', '/var/spool/postfix/active',
               '/var/spool/postfix/incoming', '/var/spool/postfix/maildrop']
 MAILQ_CAP = 100000
 VHOSTS = '/var/www/vhosts'
+VHOST_SKIP = {'system', 'default', 'chroot', 'fs', 'fs-passwd', '.skel'}
 DOMAIN_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
 # Combined log format: ip - - [tijd] "METHOD pad HTTP/x" status bytes "referer" "user-agent"
-LOG_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]*\] "(?:\S+ (\S+)[^"]*|[^"]*)" (\d{3}) (\d+|-)(?: "[^"]*" "([^"]*)")?')
+LOG_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]*\] "(?:(\S+) (\S+)[^"]*|[^"]*)" (\d{3}) (\d+|-)(?: "[^"]*" "([^"]*)")?')
 LOG_MAX_BYTES = 20 * 1024 * 1024   # max. per logbestand per meting
 DU_INTERVAL = 6 * 3600
+AUTH_LOGS = ['/var/log/auth.log', '/var/log/secure']
+SSH_FAIL_RE = re.compile(r'sshd\[\d+\]: (Failed password|Invalid user|Failed publickey)')
+MODSEC_LOGS = ['/var/log/modsec_audit.log', '/var/log/apache2/modsec_audit.log']
+MODSEC_ENTRY_RE = re.compile(r'^--[0-9a-f]+-A--$|"transaction":')
+WP_SKIP_DIRS = {'wp-content', 'wp-includes', 'wp-admin', 'node_modules', 'vendor', '.git', 'logs', 'cgi-bin',
+                'error_docs', '.cache', 'tmp', 'cache', 'backup', 'backups', 'private'}
+HEAVY_RESEND = 6 * 3600
 
 
 def log(msg):
@@ -62,13 +77,26 @@ def read(path):
         return f.read()
 
 
-def run(args, timeout=15):
+def read_head(path, size=8192):
+    with open(path, 'rb') as f:
+        return f.read(size).decode('utf-8', 'replace')
+
+
+def run2(args, timeout=15, env=None):
+    """Voert een commando uit; geeft (returncode, stdout, stderr)."""
     try:
-        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
-        out, _ = p.communicate(timeout=timeout)
-        return out
-    except Exception:
-        return ''
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=env)
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out, err
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return -1, '', 'timeout'
+    except Exception as e:  # commando bestaat niet, etc.
+        return -1, '', str(e)
+
+
+def run(args, timeout=15):
+    return run2(args, timeout)[1]
 
 
 def load_conf():
@@ -91,24 +119,34 @@ def load_conf():
     return conf
 
 
+def load_conf_optional():
+    try:
+        return load_conf()
+    except SystemExit:
+        return {}
+
+
 class Collector(object):
-    def __init__(self):
+    def __init__(self, conf=None):
+        self.conf = conf or {}
         self.prev_t = None
         self.prev_cpu = None
         self.prev_disk = None
         self.prev_net = None
         self.prev_procs = {}
+        self.prev_mysql = None
         self.usernames = {}
         self.enabled = set()
         self.enabled_at = 0
         self.cpu_model = self._cpu_model()
-        self.sites = []            # domeinen die het dashboard wil meten
+        self.sites = []            # domeinen die het dashboard gedetailleerd wil meten
         self.last_rows = []
         self.log_pos = {}          # logbestand -> (inode, offset)
         self.site_info = {}        # domein -> (tijd, gebruiker, docroot)
         self.du_cache = {}         # pad -> (tijd, bytes)
         self.du_paths = []
         self.du_busy = False
+        self.slow = SlowTasks(self)
 
     # ---------- statische info ----------
 
@@ -321,7 +359,7 @@ class Collector(object):
             u['rss'] += r['rss']
             u['rio'] += r['rio']
             u['wio'] += r['wio']
-        user_list = sorted(users.values(), key=lambda u: (u['cpu'], u['rss']), reverse=True)[:25]
+        user_list = sorted(users.values(), key=lambda u: (u['cpu'], u['rss']), reverse=True)[:40]
         for u in user_list:
             u['cpu'] = round(u['cpu'], 1)
 
@@ -369,6 +407,103 @@ class Collector(object):
                     return n
         return n
 
+    # ---------- logbestanden ----------
+
+    def read_new_lines(self, path):
+        """Nieuwe regels sinds de vorige meting. De eerste keer begint hij aan het eind."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return [], False
+        prev = self.log_pos.get(path)
+        if prev is None:
+            self.log_pos[path] = (st.st_ino, st.st_size)
+            return [], False
+        ino, pos = prev
+        if st.st_ino != ino or st.st_size < pos:   # logrotatie
+            pos = 0
+        if st.st_size == pos:
+            return [], False
+        truncated = st.st_size - pos > LOG_MAX_BYTES
+        if truncated:
+            pos = st.st_size - LOG_MAX_BYTES
+        with open(path, 'rb') as fh:
+            fh.seek(pos)
+            data = fh.read(st.st_size - pos)
+        end = data.rfind(b'\n')
+        if end < 0:
+            self.log_pos[path] = (st.st_ino, pos)
+            return [], truncated
+        self.log_pos[path] = (st.st_ino, pos + end + 1)
+        return data[:end].decode('utf-8', 'replace').splitlines(), truncated
+
+    def scan_logs(self, dt):
+        """Leest de nieuwe regels uit de access-logs van alle Plesk-domeinen.
+
+        Per domein: requests, bytes, statuscodes en inlogpogingen op WordPress.
+        Voor de domeinen die het dashboard bewaakt ook populairste URL's, IP's en user-agents.
+        """
+        base = os.path.join(VHOSTS, 'system')
+        try:
+            domains = os.listdir(base)
+        except OSError:
+            return {}
+        detailed = set(self.sites)
+        result = {}
+        for domain in domains:
+            if not DOMAIN_RE.match(domain):
+                continue
+            logdir = os.path.join(base, domain, 'logs')
+            # nginx (proxy_*) ziet alle requests, ook statische bestanden; anders de Apache-logs
+            files = [os.path.join(logdir, f) for f in ('proxy_access_ssl_log', 'proxy_access_log')]
+            if not any(os.path.exists(f) for f in files):
+                files = [os.path.join(logdir, f) for f in ('access_ssl_log', 'access_log')]
+            detail = domain in detailed
+            st = {'req': 0, 'bytes': 0, 'status': [0, 0, 0, 0], 'wpl': 0, 'xml': 0, 'truncated': False,
+                  'log': os.path.basename(files[0]).replace('_ssl', '')}
+            if detail:
+                st['paths'] = collections.Counter()
+                st['ips'] = collections.Counter()
+                st['agents'] = collections.Counter()
+            for f in files:
+                lines, trunc = self.read_new_lines(f)
+                st['truncated'] = st['truncated'] or trunc
+                for line in lines:
+                    m = LOG_RE.match(line)
+                    if not m:
+                        continue
+                    ip, method, path, code, size, agent = m.groups()
+                    st['req'] += 1
+                    code = int(code)
+                    if 200 <= code < 600:
+                        st['status'][code // 100 - 2] += 1
+                    if size != '-':
+                        st['bytes'] += int(size)
+                    if method == 'POST' and path:
+                        if path.startswith('/wp-login.php'):
+                            st['wpl'] += 1
+                        elif path.startswith('/xmlrpc.php'):
+                            st['xml'] += 1
+                    if detail:
+                        st['ips'][ip] += 1
+                        if path:
+                            st['paths'][path.split('?', 1)[0][:200]] += 1
+                        if agent:
+                            st['agents'][agent[:160]] += 1
+            result[domain] = st
+        return result
+
+    def count_new(self, paths, regex):
+        n = 0
+        found = False
+        for p in paths:
+            if not os.path.exists(p):
+                continue
+            found = True
+            lines, _ = self.read_new_lines(p)
+            n += sum(1 for line in lines if regex.search(line))
+        return n if found else None
+
     # ---------- websites (Plesk) ----------
 
     def site_meta(self, domain):
@@ -407,71 +542,6 @@ class Collector(object):
         self.site_info[domain] = (time.time(), user, docroot)
         return user, docroot
 
-    def read_new_lines(self, path):
-        """Nieuwe regels sinds de vorige meting. De eerste keer begint hij aan het eind."""
-        try:
-            st = os.stat(path)
-        except OSError:
-            return [], False
-        prev = self.log_pos.get(path)
-        if prev is None:
-            self.log_pos[path] = (st.st_ino, st.st_size)
-            return [], False
-        ino, pos = prev
-        if st.st_ino != ino or st.st_size < pos:   # logrotatie
-            pos = 0
-        truncated = st.st_size - pos > LOG_MAX_BYTES
-        if truncated:
-            pos = st.st_size - LOG_MAX_BYTES
-        with open(path, 'rb') as fh:
-            fh.seek(pos)
-            data = fh.read(st.st_size - pos)
-        end = data.rfind(b'\n')
-        if end < 0:
-            self.log_pos[path] = (st.st_ino, pos)
-            return [], truncated
-        self.log_pos[path] = (st.st_ino, pos + end + 1)
-        return data[:end].decode('utf-8', 'replace').splitlines(), truncated
-
-    def log_stats(self, domain, dt):
-        logdir = os.path.join(VHOSTS, 'system', domain, 'logs')
-        # nginx (proxy_*) ziet alle requests, ook statische bestanden; anders de Apache-logs
-        files = [os.path.join(logdir, f) for f in ('proxy_access_ssl_log', 'proxy_access_log')]
-        if not any(os.path.exists(f) for f in files):
-            files = [os.path.join(logdir, f) for f in ('access_ssl_log', 'access_log')]
-        req = size = 0
-        status = [0, 0, 0, 0]
-        paths = collections.Counter()
-        ips = collections.Counter()
-        agents = collections.Counter()
-        truncated = False
-        for f in files:
-            lines, trunc = self.read_new_lines(f)
-            truncated = truncated or trunc
-            for line in lines:
-                m = LOG_RE.match(line)
-                if not m:
-                    continue
-                req += 1
-                code = int(m.group(3))
-                if 200 <= code < 600:
-                    status[code // 100 - 2] += 1
-                if m.group(4) != '-':
-                    size += int(m.group(4))
-                ips[m.group(1)] += 1
-                if m.group(2):
-                    paths[m.group(2).split('?', 1)[0][:200]] += 1
-                if m.group(5):
-                    agents[m.group(5)[:160]] += 1
-        per_min = 60.0 / dt if dt > 0 else 0
-        return {
-            'req': req, 'rpm': round(req * per_min, 1), 'bw': round(size / dt) if dt > 0 else 0,
-            's2': round(status[0] * per_min, 1), 's3': round(status[1] * per_min, 1),
-            's4': round(status[2] * per_min, 1), 's5': round(status[3] * per_min, 1),
-            'paths': paths.most_common(15), 'ips': ips.most_common(15), 'agents': agents.most_common(8),
-            'log': os.path.basename(files[0]).replace('_ssl', ''), 'log_truncated': truncated,
-        }
-
     def _du_worker(self, paths):
         try:
             for p in paths:
@@ -493,9 +563,10 @@ class Collector(object):
             t.daemon = True
             t.start()
 
-    def site_stats(self, dt):
+    def site_stats(self, dt, logs):
         out = {}
         du_paths = []
+        per_min = 60.0 / dt if dt > 0 else 0
         for domain in [d for d in self.sites if DOMAIN_RE.match(d)]:
             if not os.path.isdir(os.path.join(VHOSTS, 'system', domain)):
                 out[domain] = {'found': False}
@@ -509,7 +580,8 @@ class Collector(object):
             disk_path = home if os.path.isdir(home) and not os.path.islink(home) else docroot
             if disk_path:
                 du_paths.append(disk_path)
-            stats = {
+            lg = logs.get(domain) or {'req': 0, 'bytes': 0, 'status': [0, 0, 0, 0], 'log': None, 'truncated': False}
+            out[domain] = {
                 'found': True, 'user': user, 'docroot': docroot,
                 'cpu': round(sum(r['cpu'] for r in procs), 1),
                 'rss': sum(r['rss'] for r in procs),
@@ -517,12 +589,115 @@ class Collector(object):
                 'procs': len(procs),
                 'top': sorted(procs, key=lambda r: (r['cpu'], r['rss']), reverse=True)[:15],
                 'disk': self.du_cache.get(disk_path, (0, None))[1] if disk_path else None,
+                'req': lg['req'], 'rpm': round(lg['req'] * per_min, 1),
+                'bw': round(lg['bytes'] / dt) if dt > 0 else 0,
+                's2': round(lg['status'][0] * per_min, 1), 's3': round(lg['status'][1] * per_min, 1),
+                's4': round(lg['status'][2] * per_min, 1), 's5': round(lg['status'][3] * per_min, 1),
+                'paths': lg['paths'].most_common(15) if 'paths' in lg else [],
+                'ips': lg['ips'].most_common(15) if 'ips' in lg else [],
+                'agents': lg['agents'].most_common(8) if 'agents' in lg else [],
+                'log': lg['log'], 'log_truncated': lg['truncated'],
             }
-            stats.update(self.log_stats(domain, dt))
-            out[domain] = stats
         self.du_paths = du_paths
         self.refresh_disk_usage()
         return out
+
+    # ---------- MySQL / MariaDB ----------
+
+    def mysql_cmd(self, sql, vertical=False, timeout=20):
+        args = ['mysql']
+        env = None
+        if self.conf.get('mysql_defaults'):
+            args.append('--defaults-file=%s' % self.conf['mysql_defaults'])
+        elif os.path.exists('/etc/psa/.psa.shadow'):
+            env = dict(os.environ, MYSQL_PWD=read('/etc/psa/.psa.shadow').strip())
+            args.append('-uadmin')
+        elif os.path.exists('/etc/mysql/debian.cnf'):
+            args.append('--defaults-file=/etc/mysql/debian.cnf')
+        args.append('--connect-timeout=5')
+        args += ['-e', sql] if vertical else ['-N', '-B', '-e', sql]
+        rc, out, err = run2(args, timeout, env)
+        if rc != 0:
+            lines = [l for l in (err or '').strip().splitlines() if l.strip()]
+            raise RuntimeError(lines[-1][:200] if lines else 'mysql gaf foutcode %s' % rc)
+        return out
+
+    def mysql(self, dt):
+        if not any(r['name'] in ('mysqld', 'mariadbd') for r in self.last_rows):
+            return None
+        try:
+            status = {}
+            for line in self.mysql_cmd(
+                    "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Questions',"
+                    "'Slow_queries','Uptime','Aborted_connects','Innodb_buffer_pool_reads',"
+                    "'Innodb_buffer_pool_read_requests','Max_used_connections')").splitlines():
+                if '\t' in line:
+                    k, v = line.split('\t', 1)
+                    status[k] = v.strip()
+            variables = {}
+            for line in self.mysql_cmd("SHOW GLOBAL VARIABLES WHERE Variable_name IN "
+                                       "('max_connections','version','slow_query_log','long_query_time')").splitlines():
+                if '\t' in line:
+                    k, v = line.split('\t', 1)
+                    variables[k] = v.strip()
+            questions = int(status.get('Questions', 0))
+            slow = int(status.get('Slow_queries', 0))
+            qps = slow_rate = 0.0
+            if self.prev_mysql and dt > 0:
+                qps = max(0.0, (questions - self.prev_mysql[0]) / dt)
+                slow_rate = max(0.0, (slow - self.prev_mysql[1]) * 60.0 / dt)
+            self.prev_mysql = (questions, slow)
+            reads = float(status.get('Innodb_buffer_pool_reads', 0))
+            requests = float(status.get('Innodb_buffer_pool_read_requests', 0)) or 1.0
+
+            long_q = []
+            for line in self.mysql_cmd(
+                    "SELECT ID, USER, IFNULL(DB,''), TIME, IFNULL(STATE,''), "
+                    "LEFT(REPLACE(REPLACE(REPLACE(IFNULL(INFO,''),'\\n',' '),'\\r',' '),'\\t',' '),300) "
+                    "FROM information_schema.PROCESSLIST WHERE COMMAND NOT IN ('Sleep','Daemon','Binlog Dump','Binlog Dump GTID') "
+                    "AND USER NOT IN ('system user','event_scheduler') AND ID <> CONNECTION_ID() ORDER BY TIME DESC LIMIT 15").splitlines():
+                f = line.split('\t')
+                if len(f) >= 6:
+                    long_q.append({'id': int(f[0]), 'user': f[1], 'db': f[2], 'time': int(f[3] or 0), 'state': f[4], 'info': f[5]})
+            users = []
+            for line in self.mysql_cmd("SELECT USER, COUNT(*) FROM information_schema.PROCESSLIST "
+                                       "GROUP BY USER ORDER BY 2 DESC LIMIT 15").splitlines():
+                f = line.split('\t')
+                if len(f) == 2:
+                    users.append([f[0], int(f[1])])
+
+            repl = None
+            try:
+                vert = self.mysql_cmd('SHOW SLAVE STATUS\\G', vertical=True)
+            except RuntimeError:
+                try:
+                    vert = self.mysql_cmd('SHOW REPLICA STATUS\\G', vertical=True).replace('Replica_', 'Slave_').replace('Source_', 'Master_').replace('Behind_Source', 'Behind_Master')
+                except RuntimeError:
+                    vert = ''
+            if vert.strip():
+                kv = {}
+                for line in vert.splitlines():
+                    if ':' in line and not line.strip().startswith('*'):
+                        k, v = line.split(':', 1)
+                        kv[k.strip()] = v.strip()
+                lag = kv.get('Seconds_Behind_Master')
+                repl = {'io': kv.get('Slave_IO_Running', '?'), 'sql': kv.get('Slave_SQL_Running', '?'),
+                        'lag': int(lag) if lag and lag.isdigit() else None,
+                        'master': kv.get('Master_Host'), 'error': kv.get('Last_Error') or kv.get('Last_IO_Error') or ''}
+            return {
+                'version': variables.get('version'),
+                'conns': int(status.get('Threads_connected', 0)),
+                'running': int(status.get('Threads_running', 0)),
+                'max_conn': int(variables.get('max_connections', 0)) or None,
+                'max_used': int(status.get('Max_used_connections', 0)),
+                'qps': round(qps, 1), 'slow': round(slow_rate, 2),
+                'slow_log': variables.get('slow_query_log'), 'long_query_time': variables.get('long_query_time'),
+                'uptime': int(status.get('Uptime', 0)), 'aborted': int(status.get('Aborted_connects', 0)),
+                'hit': round((1 - reads / requests) * 100, 2),
+                'long': long_q, 'users': users, 'repl': repl,
+            }
+        except Exception as e:
+            return {'error': str(e)[:200]}
 
     # ---------- alles samen ----------
 
@@ -565,9 +740,25 @@ class Collector(object):
 
         mem = self.memory()
         services, failed = self.services()
+        procs = self.processes(dt, uptime, mem['total'])
+        logs = self.scan_logs(dt)
+
+        security = {
+            'ssh_fail': self.count_new(AUTH_LOGS, SSH_FAIL_RE) or 0,
+            'modsec': self.count_new(MODSEC_LOGS, MODSEC_ENTRY_RE) or 0,
+            'wpl': sum(l['wpl'] for l in logs.values()),
+            'xml': sum(l['xml'] for l in logs.values()),
+            'f2b': self.slow.get('f2b'),
+        }
+        usage = {}
+        for domain, l in logs.items():
+            if l['req'] or l['wpl'] or l['xml']:
+                usage[domain] = [l['req'], l['bytes'], l['status'][3], l['wpl'], l['xml']]
+
         payload = {
             'agent': VERSION,
             'ts': int(now),
+            'dt': round(dt, 1),
             'system': self.system_info(uptime),
             'cpu': cpu,
             'load': [round(x, 2) for x in os.getloadavg()],
@@ -575,19 +766,329 @@ class Collector(object):
             'disks': self.disks(),
             'diskio': diskio,
             'net': net,
-            'procs': self.processes(dt, uptime, mem['total']),
+            'procs': procs,
             'services': services,
             'failed': failed,
             'mailq': self.mailq(),
+            'security': security,
+            'usage': {'domains': usage},
         }
+        mysql = self.mysql(dt)
+        if mysql is not None:
+            payload['mysql'] = mysql
         if self.sites:
-            payload['sites'] = self.site_stats(dt)
+            payload['sites'] = self.site_stats(dt, logs)
+        payload['_heavy'] = self.slow.pending(payload)
         self.prev_t, self.prev_cpu, self.prev_disk, self.prev_net = now, cpu_t, disk_t, net_t
         return payload
 
 
+class SlowTasks(object):
+    """Trage controles in een achtergrondthread; resultaten gaan mee zodra ze veranderen (of elke 6 uur)."""
+
+    def __init__(self, collector):
+        self.c = collector
+        self.lock = threading.Lock()
+        self.results = {}      # naam -> resultaat
+        self.versions = {}     # naam -> versienummer van het resultaat
+        self.sent = {}         # naam -> (versie, tijd) laatst succesvol verstuurd
+        self.next_run = {}
+        self.thread = None
+
+    def tasks(self):
+        t = [('f2b', 300, self.task_f2b), ('backups', 600, self.task_backups), ('updates', 3600, self.task_updates),
+             ('domains', 3600, self.task_domains), ('dbs', 21600, self.task_dbs)]
+        if self.c.conf.get('wordpress', '1') not in ('0', 'false', 'no'):
+            t.append(('wordpress', 21600, self.task_wordpress))
+        return t
+
+    def set(self, name, value):
+        with self.lock:
+            if self.results.get(name) != value:
+                self.versions[name] = self.versions.get(name, 0) + 1
+            self.results[name] = value
+
+    def get(self, name):
+        with self.lock:
+            return self.results.get(name)
+
+    def run_all(self):
+        for name, _, fn in self.tasks():
+            self.run_task(name, fn)
+
+    def run_task(self, name, fn):
+        try:
+            res = fn()
+            if name == 'domains':
+                if res is not None:
+                    self.set('domains', res[0])
+                    self.set('user_domains', res[1])
+            else:
+                self.set(name, res)
+        except Exception as e:
+            log('controle %s mislukt: %s' % (name, e))
+
+    def start(self):
+        def loop():
+            time.sleep(10)
+            while True:
+                now = time.time()
+                for name, interval, fn in self.tasks():
+                    if now >= self.next_run.get(name, 0):
+                        self.next_run[name] = now + interval
+                        self.run_task(name, fn)
+                time.sleep(15)
+        self.thread = threading.Thread(target=loop)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def pending(self, payload):
+        """Voegt nieuwe of al lang niet verstuurde resultaten toe aan de payload."""
+        heavy = {}
+        now = time.time()
+        with self.lock:
+            for name in ('backups', 'updates', 'domains', 'user_domains', 'dbs', 'wordpress'):
+                if name not in self.results:
+                    continue
+                version = self.versions.get(name, 0)
+                sent = self.sent.get(name)
+                if sent and sent[0] == version and now - sent[1] < HEAVY_RESEND:
+                    continue
+                payload[name] = self.results[name]
+                heavy[name] = version
+        return heavy
+
+    def ack(self, heavy):
+        now = time.time()
+        with self.lock:
+            for name, version in heavy.items():
+                self.sent[name] = (version, now)
+
+    # ---------- taken ----------
+
+    @staticmethod
+    def task_f2b():
+        rc, out, _ = run2(['fail2ban-client', 'status'], 20)
+        if rc != 0:
+            return None
+        m = re.search(r'Jail list:\s*(.*)', out)
+        jails = []
+        for name in [j.strip() for j in (m.group(1) if m else '').split(',') if j.strip()]:
+            o = run(['fail2ban-client', 'status', name], 20)
+            cur = re.search(r'Currently banned:\s*(\d+)', o)
+            tot = re.search(r'Total banned:\s*(\d+)', o)
+            jails.append({'name': name, 'banned': int(cur.group(1)) if cur else 0, 'total': int(tot.group(1)) if tot else 0})
+        return {'jails': jails, 'banned': sum(j['banned'] for j in jails)}
+
+    @staticmethod
+    def task_updates():
+        total = security = None
+        rc, out, err = run2(['/usr/lib/update-notifier/apt-check'], 180)
+        m = re.match(r'^(\d+);(\d+)', (err or out or '').strip())
+        if m:
+            total, security = int(m.group(1)), int(m.group(2))
+        packages = []
+        out = run(['apt-get', '-s', '-o', 'Debug::NoLocking=1', 'upgrade'], 300)
+        for line in out.splitlines():
+            if line.startswith('Inst '):
+                parts = line.split()
+                packages.append([parts[1], '-security' in line])
+        if total is None:
+            total = len(packages)
+            security = sum(1 for _, s in packages if s)
+        packages.sort(key=lambda p: (not p[1], p[0]))
+        return {'total': total, 'security': security, 'packages': packages[:80], 'checked': int(time.time())}
+
+    def task_backups(self):
+        result = {'checked': int(time.time()), 'source': None, 'last': None, 'count': 0}
+        candidates = []   # (tijd, grootte, status, naam, bron)
+
+        # Plesk: metadata van server- en abonnementsback-ups in /var/lib/psa/dumps
+        dumps = '/var/lib/psa/dumps'
+        if os.path.isdir(dumps):
+            result['source'] = 'plesk'
+            infos = glob.glob(os.path.join(dumps, 'backup_info_*.xml')) + \
+                glob.glob(os.path.join(dumps, 'clients', '*', 'domains', '*', 'backup_info_*.xml')) + \
+                glob.glob(os.path.join(dumps, 'domains', '*', 'backup_info_*.xml'))
+            result['count'] = len(infos)
+            if infos:
+                newest = max(infos, key=os.path.getmtime)
+                m = re.search(r'_(\d{10})\.xml$', newest)
+                size = 0
+                if m:
+                    token = m.group(1)
+                    for root, _, files in os.walk(dumps):
+                        for f in files:
+                            if token in f:
+                                try:
+                                    size += os.path.getsize(os.path.join(root, f))
+                                except OSError:
+                                    pass
+                candidates.append([int(os.path.getmtime(newest)), size or None, 'unknown', os.path.basename(newest), 'plesk'])
+
+        # Plesk: resultaat van de laatste back-upsessie (succes / waarschuwingen / fout)
+        sessions = sorted(glob.glob('/usr/local/psa/PMM/sessions/*'), key=os.path.getmtime, reverse=True)[:30]
+        for sess in sessions:
+            status = None
+            for f in glob.glob(os.path.join(sess, '*')):
+                if not os.path.isfile(f) or os.path.getsize(f) > 5 * 1024 * 1024:
+                    continue
+                try:
+                    head = read_head(f, 65536)
+                except (IOError, OSError):
+                    continue
+                m = re.search(r'<execution-result[^>]*status="(\w+)"', head)
+                if m:
+                    status = m.group(1).lower()
+                    break
+            if status:
+                ts = int(os.path.getmtime(sess))
+                if candidates and abs(candidates[0][0] - ts) < 6 * 3600:
+                    candidates[0][2] = 'error' if status == 'error' else 'warnings' if status == 'warnings' else 'success'
+                    candidates[0][0] = max(candidates[0][0], ts) if status != 'error' else candidates[0][0]
+                elif not candidates:
+                    candidates.append([ts, None, 'error' if status == 'error' else 'warnings' if status == 'warnings' else 'success',
+                                       os.path.basename(sess), 'plesk'])
+                break
+
+        # Eigen back-upmappen uit de configuratie (bijv. mariabackup op de databaseserver)
+        for path in [p.strip() for p in self.c.conf.get('backup_paths', '').split(',') if p.strip()]:
+            result['source'] = result['source'] or 'paths'
+            newest = None
+            seen = 0
+            for root, dirs, files in os.walk(path):
+                depth = root[len(path):].count(os.sep)
+                if depth >= 3:
+                    dirs[:] = []
+                for f in files:
+                    seen += 1
+                    full = os.path.join(root, f)
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        continue
+                    if not newest or st.st_mtime > newest[0]:
+                        newest = (st.st_mtime, st.st_size, full)
+                if seen > 20000:
+                    break
+            if newest:
+                candidates.append([int(newest[0]), newest[1], 'success', newest[2], 'paths'])
+
+        if candidates:
+            best = max(candidates, key=lambda c: c[0])
+            result['last'] = {'ts': best[0], 'size': best[1], 'status': best[2], 'name': best[3], 'source': best[4]}
+        return result if result['source'] else None
+
+    @staticmethod
+    def task_domains():
+        domains = []
+        rc, out, _ = run2(['plesk', 'bin', 'site', '--list'], 120)
+        if rc == 0:
+            domains = [l.strip().lower() for l in out.splitlines() if DOMAIN_RE.match(l.strip().lower())]
+        if not domains:
+            try:
+                domains = [d for d in os.listdir(os.path.join(VHOSTS, 'system')) if DOMAIN_RE.match(d)]
+            except OSError:
+                return None
+        user_domains = {}
+        try:
+            for d in sorted(os.listdir(VHOSTS)):
+                full = os.path.join(VHOSTS, d)
+                if d in VHOST_SKIP or not DOMAIN_RE.match(d) or os.path.islink(full) or not os.path.isdir(full):
+                    continue
+                uid = os.stat(full).st_uid
+                if uid:
+                    try:
+                        user_domains.setdefault(pwd.getpwuid(uid).pw_name, d)
+                    except KeyError:
+                        pass
+        except OSError:
+            pass
+        return sorted(set(domains)), user_domains
+
+    def task_dbs(self):
+        if not any(r['name'] in ('mysqld', 'mariadbd') for r in self.c.last_rows):
+            return None
+        out = self.c.mysql_cmd(
+            "SELECT table_schema, SUM(data_length + index_length), SUM(data_free), COUNT(*) FROM information_schema.TABLES "
+            "WHERE table_schema NOT IN ('information_schema','performance_schema','sys','mysql') "
+            "GROUP BY table_schema ORDER BY 2 DESC LIMIT 50", timeout=600)
+        dbs = []
+        for line in out.splitlines():
+            f = line.split('\t')
+            if len(f) == 4:
+                dbs.append([f[0], int(float(f[1] or 0)), int(float(f[2] or 0)), int(f[3] or 0)])
+        return {'list': dbs, 'checked': int(time.time())}
+
+    @staticmethod
+    def wp_header(text, key):
+        m = re.search(r'^[ \t/*#@]*' + key + r':\s*(.+)$', text, re.M | re.I)
+        return m.group(1).strip()[:40] if m else None
+
+    def task_wordpress(self):
+        """Zoekt WordPress-installaties en leest core-, plugin- en themaversies (zonder PHP uit te voeren)."""
+        if not os.path.isdir(VHOSTS):
+            return None
+        sites = []
+        started = time.time()
+        for vhost in sorted(os.listdir(VHOSTS)):
+            if vhost in VHOST_SKIP or not DOMAIN_RE.match(vhost):
+                continue
+            base = os.path.join(VHOSTS, vhost)
+            if os.path.islink(base) or not os.path.isdir(base):
+                continue
+            for root, dirs, files in os.walk(base):
+                rel = os.path.relpath(root, base)
+                depth = 0 if rel == '.' else rel.count(os.sep) + 1
+                dirs[:] = [d for d in dirs if d not in WP_SKIP_DIRS and not d.startswith('.')] if depth < 3 else []
+                if 'wp-config.php' not in files and not os.path.exists(os.path.join(root, 'wp-includes', 'version.php')):
+                    continue
+                try:
+                    vtext = read(os.path.join(root, 'wp-includes', 'version.php'))
+                except (IOError, OSError):
+                    continue
+                m = re.search(r"\$wp_version\s*=\s*'([^']+)'", vtext)
+                if not m:
+                    continue
+                dirs[:] = []
+                domain = vhost
+                for part in ([] if rel == '.' else rel.split(os.sep)):
+                    if DOMAIN_RE.match(part):
+                        domain = part
+                plugins = []
+                pdir = os.path.join(root, 'wp-content', 'plugins')
+                for slug in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
+                    sdir = os.path.join(pdir, slug)
+                    if not os.path.isdir(sdir):
+                        continue
+                    for php in sorted(glob.glob(os.path.join(sdir, '*.php')))[:25]:
+                        try:
+                            head = read_head(php)
+                        except (IOError, OSError):
+                            continue
+                        if re.search(r'Plugin Name:', head, re.I):
+                            plugins.append([slug, self.wp_header(head, 'Version')])
+                            break
+                themes = []
+                tdir = os.path.join(root, 'wp-content', 'themes')
+                for slug in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
+                    css = os.path.join(tdir, slug, 'style.css')
+                    if os.path.isfile(css):
+                        try:
+                            themes.append([slug, self.wp_header(read_head(css), 'Version')])
+                        except (IOError, OSError):
+                            pass
+                sites.append({'domain': domain, 'path': os.path.join(vhost, rel) if rel != '.' else vhost,
+                              'version': m.group(1), 'plugins': plugins, 'themes': themes})
+            if time.time() - started > 1200:   # max. 20 minuten per ronde
+                break
+        return {'sites': sites, 'checked': int(time.time())}
+
+
 def send(conf, payload):
-    data = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    body = dict(payload)
+    body.pop('_heavy', None)
+    data = json.dumps(body, separators=(',', ':')).encode('utf-8')
     req = urllib.request.Request(conf['url'] + '/api/ingest', data=data, headers={
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + conf['token'],
@@ -597,7 +1098,7 @@ def send(conf, payload):
     if conf['insecure']:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+    with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
         try:
             return json.loads(r.read().decode('utf-8') or '{}')
         except ValueError:
@@ -607,16 +1108,22 @@ def send(conf, payload):
 def main():
     once = '--once' in sys.argv
     show = '--print' in sys.argv
-    conf = None if show else load_conf()
+    conf = load_conf_optional() if show else load_conf()
 
-    collector = Collector()
+    collector = Collector(conf)
     collector.collect()            # nulmeting voor de delta's
+    if show:
+        collector.slow.run_all()
     time.sleep(3 if (once or show) else 5)
 
     if show:
-        print(json.dumps(collector.collect(), indent=2))
+        payload = collector.collect()
+        payload.pop('_heavy', None)
+        print(json.dumps(payload, indent=2))
         return
 
+    if not once:
+        collector.slow.start()
     log('gestart, versie %s, interval %ss, dashboard %s' % (VERSION, conf['interval'], conf['url']))
     queue = []
     while True:
@@ -629,6 +1136,7 @@ def main():
         while queue:
             try:
                 resp = send(conf, queue[0])
+                collector.slow.ack(queue[0].get('_heavy') or {})
                 queue.pop(0)
                 if isinstance(resp.get('sites'), list):
                     collector.sites = [str(d).lower() for d in resp['sites']][:200]

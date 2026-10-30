@@ -13,6 +13,12 @@ export const DEFAULT_THRESHOLDS = {
   ssl: { warn: 21, crit: 7 },         // website: dagen tot SSL-certificaat verloopt (lager = slechter)
   err5xx: { warn: 5, crit: 20 },      // website: % requests met 5xx-fout
   siteCpu: { warn: 150, crit: 300 },  // website: CPU in % van één core (gemiddeld over sustainMinutes)
+  backupAge: { warn: 26, crit: 50 },  // uren sinds laatste geslaagde back-up
+  diskDays: { warn: 14, crit: 3 },    // dagen tot schijf vol bij huidige groei (lager = slechter)
+  dbConn: { warn: 80, crit: 95 },     // % van max_connections
+  replLag: { warn: 60, crit: 600 },   // seconden replicatie-achterstand
+  longQuery: { warn: 300, crit: 1800 }, // seconden dat de langste query loopt
+  secUpdates: { warn: 0, crit: 0 },   // openstaande security-updates (0 = alleen tonen, geen status)
   sustainMinutes: 3,
   offlineSeconds: 180,
 };
@@ -45,7 +51,7 @@ export function fmtAge(sec) {
  * @param p       laatste payload van de agent (of null)
  * @param recent  recente samples [{ts, cpu, iowait, load1, mem_pct}]
  */
-export function evaluate(server, p, recent, th, now) {
+export function evaluate(server, p, recent, th, now, ctx = {}) {
   const issues = [];
   const add = (level, key, msg) => issues.push({ level, key, msg });
 
@@ -55,7 +61,11 @@ export function evaluate(server, p, recent, th, now) {
   }
   const age = now - server.last_seen;
   if (age > th.offlineSeconds) {
-    add('crit', 'offline', `Offline — geen data sinds ${fmtAge(age)}`);
+    const reach = ctx.reach;
+    const fresh = reach && now - reach.ts < 300;
+    if (fresh && reach.ok) add('warn', 'offline', `Agent stuurt geen data sinds ${fmtAge(age)} — server is wel bereikbaar (TCP ${reach.port})`);
+    else if (fresh) add('crit', 'offline', `Onbereikbaar — geen agentdata sinds ${fmtAge(age)} en TCP ${reach.ports.join(', ')} reageert niet`);
+    else add('crit', 'offline', `Offline — geen data sinds ${fmtAge(age)}`);
     return finish(server, issues, true);
   }
 
@@ -95,6 +105,57 @@ export function evaluate(server, p, recent, th, now) {
   }
 
   if (p.mailq != null) check('mailq', p.mailq, th.mailq, () => `Mailwachtrij: ${p.mailq} berichten`);
+
+  // Trendvoorspelling schijven (lager = slechter)
+  for (const f of ctx.forecast || []) {
+    if (f.days == null) continue;
+    const msg = `Schijf ${f.mount} is over ${f.days < 1 ? 'minder dan een dag' : `${Math.round(f.days)} dagen`} vol (+${f.perDay.toFixed(2)}%/dag)`;
+    if (f.days <= th.diskDays.crit) add('crit', 'diskfull', msg);
+    else if (f.days <= th.diskDays.warn) add('warn', 'diskfull', msg);
+  }
+
+  // Back-ups
+  const extra = ctx.extra || {};
+  const backupCfg = ctx.config?.backup || {};
+  if (backupCfg.enabled !== false && extra.backups) {
+    const b = extra.backups;
+    const warnH = backupCfg.maxAgeHours || th.backupAge.warn;
+    const critH = Math.max(warnH, backupCfg.maxAgeHours ? warnH * 2 : th.backupAge.crit);
+    if (!b.last) add('warn', 'backup', 'Geen back-up gevonden');
+    else {
+      const hours = (now - b.last.ts) / 3600;
+      if (b.last.status === 'error') add('crit', 'backup', `Laatste back-up mislukt (${fmtAge(now - b.last.ts)} geleden)`);
+      else if (hours >= critH) add('crit', 'backup', `Laatste back-up is ${fmtAge(now - b.last.ts)} oud`);
+      else if (hours >= warnH) add('warn', 'backup', `Laatste back-up is ${fmtAge(now - b.last.ts)} oud`);
+      else if (b.last.status === 'warnings') add('warn', 'backup', 'Laatste back-up gelukt met waarschuwingen');
+    }
+  }
+
+  // Updates
+  const upd = extra.updates;
+  if (upd?.security > 0) {
+    const msg = `${upd.security} security-update${upd.security === 1 ? '' : 's'} beschikbaar`;
+    if (th.secUpdates.crit > 0 && upd.security >= th.secUpdates.crit) add('crit', 'updates', msg);
+    else if (th.secUpdates.warn > 0 && upd.security >= th.secUpdates.warn) add('warn', 'updates', msg);
+    else add('info', 'updates', msg);
+  }
+
+  // Database (MySQL/MariaDB)
+  const m = p.mysql;
+  if (m && !m.error) {
+    if (m.max_conn) {
+      const pct = (m.conns / m.max_conn) * 100;
+      check('dbConn', pct, th.dbConn, () => `Database: ${m.conns} van ${m.max_conn} verbindingen (${pct.toFixed(0)}%)`);
+    }
+    if (m.repl) {
+      if (m.repl.io !== 'Yes' || m.repl.sql !== 'Yes') add('crit', 'repl', `Replicatie gestopt (IO: ${m.repl.io}, SQL: ${m.repl.sql})`);
+      else check('replLag', m.repl.lag, th.replLag, () => `Replicatie loopt ${m.repl.lag} s achter`);
+    }
+    const longest = (m.long || [])[0];
+    if (longest) check('longQuery', longest.time, th.longQuery, () => `Query loopt al ${fmtAge(longest.time)} (${longest.user}@${longest.db || '-'})`);
+  } else if (m?.error) {
+    add('info', 'mysql', `Database niet uit te lezen: ${m.error}`);
+  }
   if (p.system?.reboot_required) add('info', 'reboot', 'Herstart vereist (updates)');
 
   return finish(server, issues);
