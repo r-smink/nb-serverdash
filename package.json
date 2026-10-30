@@ -1,0 +1,18 @@
+{
+  "name": "nb-serverdash",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NextBuzz ServerDash - monitoring dashboard voor Ubuntu/Plesk servers",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "demo": "node --disable-warning=ExperimentalWarning scripts/simulate.js",
+    "demo:clean": "node --disable-warning=ExperimentalWarning scripts/simulate.js --clean"
+  },
+  "dependencies": {
+    "uplot": "^1.6.32"
+  }
+}

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inloggen — ServerDash</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-page">
+  <form id="login" class="login-box">
+    <div class="brand"><span class="logo"></span>ServerDash</div>
+    <label>Gebruikersnaam<input name="username" autocomplete="username" required autofocus></label>
+    <label>Wachtwoord<input name="password" type="password" autocomplete="current-password" required></label>
+    <div id="err" class="form-error"></div>
+    <button class="btn" type="submit">Inloggen</button>
+  </form>
+  <script src="/login.js"></script>
+</body>
+</html>
