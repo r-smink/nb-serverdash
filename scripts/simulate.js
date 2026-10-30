@@ -155,6 +155,51 @@ function genPayload(srv, seed, t) {
   };
 }
 
+// ---------- websites ----------
+
+const DEMO_SITES = [
+  { domain: 'autobedrijf.nl', server: 'web07', rpm: 90, cpu: 190 },                 // CPU-slurper (queue worker)
+  { domain: 'tandarts-zuid.nl', server: 'web07', rpm: 25, cpu: 60 },
+  { domain: 'webshop-xl.nl', server: 'web01', rpm: 600, cpu: 80 },                  // drukke webshop
+  { domain: 'bakkerijdejong.nl', server: 'web05', rpm: 15, cpu: 5 },
+  { domain: 'kapsalon-anna.nl', server: 'web03', rpm: 8, cpu: 3 },
+  { domain: 'makelaardij.nl', server: 'web12', rpm: 120, cpu: 40, err: 0.12 },      // veel 5xx-fouten
+  { domain: 'nextbuzz.nl', server: 'web21', rpm: 40, cpu: 12 },
+  { domain: 'restaurant-zee.nl', server: 'web19', rpm: 20, cpu: 8, down: true },   // server offline
+];
+
+const PATHS = ['/', '/wp-admin/admin-ajax.php', '/wp-login.php', '/xmlrpc.php', '/producten', '/winkelwagen', '/contact',
+  '/wp-content/uploads/2026/10/header.jpg', '/feed/', '/sitemap.xml', '/api/voorraad', '/.env'];
+const AGENTS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0', 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Safari/604.1',
+  'Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)', 'Mozilla/5.0 (compatible; Googlebot/2.1)',
+  'Mozilla/5.0 (compatible; SemrushBot/7~bl)', 'WordPress/6.6; https://example.nl', 'python-requests/2.32'];
+
+function genSiteStats(site, seed, t, srvName) {
+  const hourOfDay = new Date(t * 1000).getHours();
+  const daily = 0.35 + 0.65 * Math.max(0, Math.sin(((hourOfDay - 7) / 24) * 2 * Math.PI));
+  const rpm = site.rpm * daily * (0.6 + 0.8 * noise(seed, t, 300));
+  const err = site.err ? site.err * (0.6 + 0.8 * noise(seed + 1, t, 600)) : 0.002;
+  const cpu = site.cpu * (0.5 + 0.5 * daily) * (0.7 + 0.6 * noise(seed + 2, t, 240));
+  const user = site.domain.replace(/\..*$/, '').replace(/-/g, '_').slice(0, 12);
+  const pick = (arr, n, s) => arr.map((k, i) => [k, Math.max(1, Math.round(n * (0.5 + hash(s + i * 7 + Math.floor(t / 60))) / (i + 1)))])
+    .sort((a, b) => b[1] - a[1]);
+  const top = [
+    { pid: 20000 + seed * 10, ppid: 1, user, name: 'php-fpm', cmd: `php-fpm: pool ${site.domain}`, cpu: Math.round(cpu * 0.6 * 10) / 10, rss: 120e6 + seed * 9e6, mem: 0.4, rio: 0, wio: 2000, ctime: 8000, age: 86400 * 2, thr: 1, st: 'R' },
+    { pid: 20001 + seed * 10, ppid: 1, user, name: 'php-fpm', cmd: `php-fpm: pool ${site.domain}`, cpu: Math.round(cpu * 0.3 * 10) / 10, rss: 95e6, mem: 0.3, rio: 0, wio: 0, ctime: 3000, age: 3600, thr: 1, st: 'S' },
+  ];
+  if (site.cpu > 100) top.unshift({ pid: 20005 + seed * 10, ppid: 1, user, name: 'php', cmd: `/opt/plesk/php/8.2/bin/php /var/www/vhosts/${site.domain}/httpdocs/artisan queue:work --tries=3`, cpu: Math.round(cpu * 0.9 * 10) / 10, rss: 380e6, mem: 0.6, rio: 1e4, wio: 5e4, ctime: 250000, age: 3 * 86400 + 4000, thr: 1, st: 'R' });
+  return {
+    found: true, user, docroot: `/var/www/vhosts/${site.domain}/httpdocs`,
+    cpu: Math.round(cpu * 10) / 10, rss: Math.round(top.reduce((a, p) => a + p.rss, 0)), rio: Math.round(5e4 * noise(seed + 3, t, 120)),
+    wio: Math.round(2e5 * noise(seed + 4, t, 120)), procs: top.length + 2, top,
+    disk: (2 + (seed * 7) % 40) * 1024 ** 3,
+    req: Math.round(rpm / 2), rpm: Math.round(rpm * 10) / 10, bw: Math.round(rpm * 85e3 / 60),
+    s2: Math.round(rpm * (0.82 - err) * 10) / 10, s3: Math.round(rpm * 0.12 * 10) / 10, s4: Math.round(rpm * 0.06 * 10) / 10, s5: Math.round(rpm * err * 10) / 10,
+    paths: pick(PATHS, rpm / 3, seed), ips: pick(['203.0.113.7', '198.51.100.23', '192.0.2.44', '2001:db8::17', '203.0.113.99', '198.51.100.4'], rpm / 4, seed + 50),
+    agents: pick(AGENTS, rpm / 3, seed + 90), log: 'proxy_access_log', log_truncated: false, srv: srvName,
+  };
+}
+
 // ---------- servers aanmaken + historie ----------
 
 const now = store.nowSec();
@@ -186,6 +231,29 @@ for (const s of servers) {
   if (scenario[s.name]?.offline) store.markSeen(s.id, end, JSON.stringify(genPayload(s, s.seed, end)));
 }
 store.db.exec('COMMIT');
+
+console.log('Demo-websites aanmaken…');
+const existingSites = store.listWebsites();
+store.db.exec('BEGIN');
+for (const [i, site] of DEMO_SITES.entries()) {
+  const srv = servers.find((s) => s.name === site.server);
+  if (existingSites.some((w) => w.domain === site.domain)) continue;
+  const w = store.createWebsite({
+    server_id: srv.id, domain: site.domain, keyword: '', notes: 'Demo-website', check_enabled: true,
+    url: site.down ? 'http://127.0.0.1:9/' : `${BASE}/login.html`,
+  });
+  const end = site.down ? now - 7200 : now - LIVE_INTERVAL;
+  for (let t = now - 7 * 86400; t <= now - 60; t += 120) {
+    const stats = genSiteStats(site, i + 1, t, srv.name);
+    if (t <= end) store.insertSiteMetrics(w.id, t, stats);
+    const up = t <= end && hash(t + i) > 0.002;
+    store.insertCheck(w.id, t, up, up ? 200 : null, up ? Math.round(stats.rpm > 300 ? 180 + 300 * noise(i, t, 600) : 60 + 120 * noise(i, t, 600)) : null);
+  }
+  if (!site.down) store.setSiteStats(w.id, now, JSON.stringify(genSiteStats(site, i + 1, now, srv.name)));
+  else store.setSiteStats(w.id, end, JSON.stringify(genSiteStats(site, i + 1, end, srv.name)));
+}
+store.db.exec('COMMIT');
+
 console.log(`${servers.length} demo-servers klaar. Live metingen naar ${BASE} elke ${LIVE_INTERVAL}s (Ctrl+C om te stoppen).`);
 
 // ---------- live ----------
@@ -194,12 +262,22 @@ async function tick() {
   const t = store.nowSec();
   await Promise.all(servers.filter((s) => !scenario[s.name]?.offline).map(async (s) => {
     try {
+      const payload = genPayload(s, s.seed, t);
+      // Net als de echte agent: meet de sites die het dashboard in de vorige response noemde.
+      if (s.sites?.length) {
+        payload.sites = {};
+        for (const domain of s.sites) {
+          const idx = DEMO_SITES.findIndex((d) => d.domain === domain);
+          payload.sites[domain] = idx >= 0 ? genSiteStats(DEMO_SITES[idx], idx + 1, t, s.name) : { found: false };
+        }
+      }
       const r = await fetch(`${BASE}/api/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${s.token}` },
-        body: JSON.stringify(genPayload(s, s.seed, t)),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) console.warn(`${s.name}: HTTP ${r.status}`);
+      else s.sites = (await r.json()).sites;
     } catch (e) {
       console.warn(`${s.name}: ${e.message} — draait het dashboard (npm start)?`);
     }

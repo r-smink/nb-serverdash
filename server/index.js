@@ -5,7 +5,8 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { config } from './config.js';
 import * as store from './db.js';
-import { evaluate, mergeThresholds, DEFAULT_THRESHOLDS } from './status.js';
+import { evaluate, evaluateSite, mergeThresholds, DEFAULT_THRESHOLDS } from './status.js';
+import { checkUrl } from './checker.js';
 
 if (!config.adminPassword) {
   console.error('ADMIN_PASSWORD is niet ingesteld. Kopieer .env.example naar .env en vul een wachtwoord in.');
@@ -179,6 +180,121 @@ function serverSummary(s, th, now) {
   };
 }
 
+// ---------- websites ----------
+
+const SITE_RECENT_WINDOW = 3600;
+const siteRecent = new Map();  // websiteId -> [{ts, cpu, rpm, s2..s5}]
+const siteLevels = new Map();  // websiteId -> laatst bekende level
+
+function getSiteRecent(id) {
+  let list = siteRecent.get(id);
+  if (!list) {
+    list = store.recentSiteMetrics(id, nowSec() - SITE_RECENT_WINDOW);
+    siteRecent.set(id, list);
+  }
+  return list;
+}
+
+function pushSiteRecent(id, sample) {
+  const list = getSiteRecent(id);
+  if (list.length && list[list.length - 1].ts >= sample.ts) return;
+  list.push(sample);
+  const cutoff = nowSec() - SITE_RECENT_WINDOW;
+  while (list.length && list[0].ts < cutoff) list.shift();
+}
+
+const parse = (json) => { try { return json ? JSON.parse(json) : null; } catch { return null; } };
+
+function siteStatus(w, server, th = thresholds(), now = nowSec()) {
+  return evaluateSite(w, server, parse(w.last_stats), parse(w.last_check), getSiteRecent(w.id), th, now);
+}
+
+function siteSpark(id, now) {
+  const points = new Array(60).fill(null);
+  const start = now - 3600;
+  for (const r of getSiteRecent(id)) {
+    const i = Math.floor((r.ts - start) / 60);
+    if (i >= 0 && i < 60 && r.rpm != null) points[i] = Math.max(points[i] ?? 0, r.rpm);
+  }
+  return points;
+}
+
+function siteSummary(w, serversById, th, now) {
+  const server = serversById.get(w.server_id);
+  const stats = parse(w.last_stats);
+  const check = parse(w.last_check);
+  return {
+    id: w.id, domain: w.domain, url: w.url, keyword: w.keyword, check_enabled: !!w.check_enabled, notes: w.notes,
+    server: server ? { id: server.id, name: server.name, hostname: server.hostname } : null,
+    server_id: w.server_id,
+    status: evaluateSite(w, server, stats, check, getSiteRecent(w.id), th, now),
+    stats: stats && {
+      found: stats.found, user: stats.user, cpu: stats.cpu, rss: stats.rss, rio: stats.rio, wio: stats.wio, procs: stats.procs,
+      rpm: stats.rpm, bw: stats.bw, s2: stats.s2, s3: stats.s3, s4: stats.s4, s5: stats.s5, disk: stats.disk,
+    },
+    stats_ts: w.last_stats_ts,
+    check, check_ts: w.last_check_ts,
+    uptime24: store.uptimeSince(w.id, now - 86400),
+    spark: siteSpark(w.id, now),
+  };
+}
+
+function trackSiteLevel(w, server, status, now, silent = false) {
+  const lvl = status.level;
+  const prev = siteLevels.get(w.id);
+  siteLevels.set(w.id, lvl);
+  if (silent || prev === undefined || prev === lvl || lvl === 'pending' || lvl === 'muted' || !server) return;
+  if (prev === 'pending' && lvl === 'ok') return;
+  const msgs = status.issues.filter((i) => i.level === 'crit' || i.level === 'warn').map((i) => i.msg).join(', ');
+  const message = `Website ${w.domain}: ${lvl === 'ok' ? 'hersteld' : `${LEVEL_TEXT[lvl].toLowerCase()} — ${msgs}`}`;
+  store.addEvent(server.id, now, lvl, message);
+  notify(server, lvl, message);
+}
+
+function checkAllSites(silent = false) {
+  const th = thresholds();
+  const now = nowSec();
+  const servers = new Map(store.listServers().map((s) => [s.id, s]));
+  const ids = new Set();
+  for (const w of store.listWebsites()) {
+    ids.add(w.id);
+    trackSiteLevel(w, servers.get(w.server_id), siteStatus(w, servers.get(w.server_id), th, now), now, silent);
+  }
+  for (const id of siteLevels.keys()) if (!ids.has(id)) { siteLevels.delete(id); siteRecent.delete(id); }
+}
+
+// HTTP-checks: elke CHECK_INTERVAL seconden per website, max. 5 tegelijk.
+const CHECK_INTERVAL = 60;
+const checking = new Set();
+
+async function runCheck(w) {
+  checking.add(w.id);
+  try {
+    const result = await checkUrl(w.url, { keyword: w.keyword });
+    const now = nowSec();
+    const fresh = store.getWebsite(w.id);
+    if (!fresh) return result;
+    const failCount = result.ok ? 0 : fresh.fail_count + 1;
+    store.insertCheck(w.id, now, result.ok, result.status, result.ms);
+    store.setSiteCheck(w.id, now, JSON.stringify({ ...result, ts: now }), failCount);
+    const updated = store.getWebsite(w.id);
+    const server = store.getServer(updated.server_id);
+    trackSiteLevel(updated, server, siteStatus(updated, server, thresholds(), now), now);
+    return result;
+  } finally {
+    checking.delete(w.id);
+  }
+}
+
+async function checkDueSites() {
+  const now = nowSec();
+  const due = store.listWebsites()
+    .filter((w) => w.check_enabled && w.url && !checking.has(w.id) && (!w.last_check_ts || now - w.last_check_ts >= CHECK_INTERVAL - 5));
+  for (let i = 0; i < due.length; i += 5) {
+    await Promise.all(due.slice(i, i + 5).map((w) => runCheck(w).catch((e) => console.warn(`Check ${w.domain}: ${e.message}`))));
+  }
+}
+
 // ---------- events & notificaties ----------
 
 const LEVEL_TEXT = { crit: 'Kritiek', warn: 'Waarschuwing', ok: 'Hersteld' };
@@ -306,7 +422,22 @@ on('POST', '/api/ingest', ({ req, body }) => {
   }
   pushRecent(s.id, { ts, cpu: body.cpu?.pct ?? null, iowait: body.cpu?.iowait ?? null, load1: body.load?.[0] ?? null, mem_pct: body.mem?.pct ?? null });
   trackLevel(s, statusOf(s, thresholds(), now), now);
-  return { ok: true };
+
+  // Websites op deze server: statistieken opslaan en de lijst domeinen teruggeven,
+  // zodat de agent weet welke sites hij de volgende keer moet meten.
+  const sites = store.websitesForServer(s.id);
+  if (body.sites && typeof body.sites === 'object') {
+    for (const w of sites) {
+      const st = body.sites[w.domain];
+      if (!st || typeof st !== 'object') continue;
+      if (st.found) {
+        store.insertSiteMetrics(w.id, ts, st);
+        pushSiteRecent(w.id, { ts, cpu: st.cpu ?? null, rpm: st.rpm ?? null, s2: st.s2 ?? 0, s3: st.s3 ?? 0, s4: st.s4 ?? 0, s5: st.s5 ?? 0 });
+      }
+      store.setSiteStats(w.id, now, JSON.stringify(st));
+    }
+  }
+  return { ok: true, sites: sites.map((w) => w.domain) };
 }, { auth: false });
 
 // --- dashboard ---
@@ -326,7 +457,9 @@ on('GET', '/api/overview', () => {
 on('GET', '/api/servers/:id', ({ params }) => {
   const s = requireServer(params.id);
   const th = thresholds();
-  return { ...serverSummary(s, th, nowSec()), thresholds: th, payload: payloadOf(s), events: store.serverEvents(s.id, 50) };
+  const now = nowSec();
+  const websites = store.websitesForServer(s.id).map((w) => ({ id: w.id, domain: w.domain, level: siteStatus(w, s, th, now).level }));
+  return { ...serverSummary(s, th, now), thresholds: th, payload: payloadOf(s), events: store.serverEvents(s.id, 50), websites };
 });
 
 on('GET', '/api/servers/:id/metrics', ({ params, query }) => {
@@ -384,6 +517,112 @@ on('DELETE', '/api/servers/:id', ({ params }) => {
   store.deleteServer(s.id);
   checkAll(true);
   return { ok: true };
+});
+
+// --- websites ---
+
+function normalizeDomain(input) {
+  const raw = String(input || '').trim().toLowerCase().replace(/^[a-z]+:\/\//, '').split(/[/?#]/)[0];
+  let host;
+  try { host = new URL(`http://${raw}`).hostname; } catch { host = ''; }
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) throw new HttpError(400, 'Ongeldig domein');
+  return host;
+}
+
+function validateWebsite(body) {
+  const server = store.getServer(Number(body.server_id));
+  if (!server) throw new HttpError(400, 'Kies een server');
+  const domain = normalizeDomain(body.domain);
+  let url = String(body.url || '').trim() || `https://${domain}/`;
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol)) throw new Error();
+    url = u.href;
+  } catch { throw new HttpError(400, 'Ongeldige controle-URL'); }
+  return {
+    server_id: server.id, domain, url,
+    keyword: String(body.keyword || '').slice(0, 200),
+    check_enabled: body.check_enabled !== false,
+    notes: String(body.notes || '').slice(0, 2000),
+  };
+}
+
+function requireWebsite(id) {
+  const w = store.getWebsite(Number(id));
+  if (!w) throw new HttpError(404, 'Website niet gevonden');
+  return w;
+}
+
+on('GET', '/api/websites', () => {
+  const th = thresholds();
+  const now = nowSec();
+  const servers = store.listServers();
+  const byId = new Map(servers.map((s) => [s.id, s]));
+  return {
+    thresholds: th,
+    enlarge: store.getSetting('enlargeProblems', true),
+    servers: servers.map((s) => ({ id: s.id, name: s.name, type: s.type })),
+    websites: store.listWebsites().map((w) => siteSummary(w, byId, th, now)),
+  };
+});
+
+on('GET', '/api/websites/:id', ({ params }) => {
+  const w = requireWebsite(params.id);
+  const th = thresholds();
+  const now = nowSec();
+  const server = store.getServer(w.server_id);
+  const summary = siteSummary(w, new Map(server ? [[server.id, server]] : []), th, now);
+  const sp = server && payloadOf(server);
+  return {
+    ...summary,
+    thresholds: th,
+    fullStats: parse(w.last_stats),
+    uptime7d: store.uptimeSince(w.id, now - 7 * 86400),
+    uptime30d: store.uptimeSince(w.id, now - 30 * 86400),
+    serverInfo: server && { cores: sp?.cpu?.cores, mem_total: sp?.mem?.total, cpu: sp?.cpu?.pct, level: statusOf(server, th, now).level },
+  };
+});
+
+on('GET', '/api/websites/:id/metrics', ({ params, query }) => {
+  const w = requireWebsite(params.id);
+  const now = nowSec();
+  const to = Math.floor(+query.get('to') || now);
+  let from = Math.floor(+query.get('from') || 0);
+  if (!from) from = to - Math.min(Math.max(+query.get('range') || 3600, 300), 31 * 86400);
+  if (from >= to) throw new HttpError(400, 'Ongeldige periode');
+  const bucket = Math.max(10, Math.floor((to - from) / 400));
+  return {
+    from, to, bucket,
+    site: store.querySiteMetrics(w.id, from, to, bucket),
+    checks: store.queryChecks(w.id, from, to, bucket),
+  };
+});
+
+on('POST', '/api/websites', ({ body }) => {
+  const w = store.createWebsite(validateWebsite(body));
+  if (w.check_enabled) runCheck(w).catch(() => {});
+  return { website: { id: w.id, domain: w.domain } };
+});
+
+on('PUT', '/api/websites/:id', ({ params, body }) => {
+  const w = requireWebsite(params.id);
+  const updated = store.updateWebsite(w.id, validateWebsite({ ...w, check_enabled: !!w.check_enabled, ...body }));
+  return { website: { id: updated.id, domain: updated.domain } };
+});
+
+on('DELETE', '/api/websites/:id', ({ params }) => {
+  const w = requireWebsite(params.id);
+  store.deleteWebsite(w.id);
+  siteLevels.delete(w.id);
+  siteRecent.delete(w.id);
+  return { ok: true };
+});
+
+on('POST', '/api/websites/:id/check', async ({ params }) => {
+  const w = requireWebsite(params.id);
+  if (!w.url) throw new HttpError(400, 'Geen controle-URL ingesteld');
+  if (checking.has(w.id)) throw new HttpError(409, 'Controle loopt al');
+  return { result: await runCheck(w) };
 });
 
 on('GET', '/api/settings', () => ({
@@ -478,7 +717,16 @@ const server = http.createServer(async (req, res) => {
 });
 
 checkAll(true);
-setInterval(() => { try { checkAll(); } catch (e) { console.error(e); } }, 15_000);
+checkAllSites(true);
+setInterval(() => {
+  try { checkAll(); checkAllSites(); } catch (e) { console.error(e); }
+}, 15_000);
+let checkLoopBusy = false;
+setInterval(async () => {
+  if (checkLoopBusy) return;
+  checkLoopBusy = true;
+  try { await checkDueSites(); } catch (e) { console.error(e); } finally { checkLoopBusy = false; }
+}, 10_000);
 setInterval(() => { try { store.purge(); } catch (e) { console.error(e); } }, 3600_000);
 setTimeout(() => store.purge(), 30_000);
 

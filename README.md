@@ -13,6 +13,15 @@ Eigen monitoringdashboard voor de Ubuntu/Plesk-servers, de nameserver en de shar
   dovecot, named, fail2ban, php-fpm-pools…) en van alle gefaalde systemd-units.
 - **Meldingen**: statuswijzigingen komen in het meldingenlog en kunnen optioneel naar een webhook (Slack, Mattermost,
   Discord, Teams-workflow).
+- **Websites**: bewaak losse websites op een van de Plesk-servers. Per site zie je:
+  - **Bereikbaarheid**: elke minuut controleert het dashboard de site. Je ziet responstijd, uptime over 24 uur, 7 en
+    30 dagen, de HTTP-status, een optioneel sleutelwoord op de pagina en hoe lang het SSL-certificaat nog geldig is.
+  - **Wat de site van de server vraagt**: CPU, geheugen, disk I/O en het aantal processen. De agent rekent alle
+    processen van de PHP-FPM-pool en de Plesk-systeemgebruiker mee (cron, CLI-scripts, queue-workers). Je ziet dit ook
+    als aandeel van de hele server.
+  - **Verkeer** uit de Plesk-logs (`/var/www/vhosts/system/<domein>/logs`): requests per minuut, 4xx/5xx-fouten,
+    bandbreedte, populairste URL's, de IP-adressen met de meeste requests en user-agents (zo herken je bots).
+  - **Schijfruimte** van de webruimte (wordt elke 6 uur op de achtergrond gemeten met `du`).
 - **Beheer**: servers toevoegen, bewerken, pauzeren (onderhoud) en verwijderen, en de drempelwaarden instellen.
 
 ## Architectuur
@@ -102,6 +111,16 @@ python3 /opt/nb-agent/nb-agent.py --print    # toon wat de agent meet, zonder te
 curl -fsSL https://monitor.nextbuzz.nl/agent/install.sh | sudo bash -s -- --uninstall
 ```
 
+Bijwerken naar een nieuwe agentversie (bijvoorbeeld 1.1 voor websitestatistieken): voer het installatiecommando
+opnieuw uit. Een nieuw token is dan niet nodig; het token staat al in `/etc/nb-agent.conf`:
+
+```bash
+curl -fsSL https://monitor.nextbuzz.nl/agent/install.sh | sudo bash -s -- --url https://monitor.nextbuzz.nl --token "$(grep ^token= /etc/nb-agent.conf | cut -d= -f2)"
+```
+
+Het dashboard geeft in elke response door welke websites er op die server bewaakt worden. De agent hoeft daarvoor dus
+niet opnieuw ingesteld te worden.
+
 De agent draait als root, omdat hij alleen zo de I/O-statistieken van processen van alle gebruikers kan lezen.
 Hij draait met `Nice=10`, idle I/O-prioriteit en een geheugenlimiet van 128 MB.
 
@@ -116,6 +135,11 @@ Hij draait met `Nice=10`, idle I/O-prioriteit en een geheugenlimiet van 128 MB.
 | Swap | 60% | 90% |
 | Schijf / inodes per mount | 85% | 95% |
 | Postfix-mailwachtrij | 500 | 2000 |
+| Website: responstijd | 2000 ms | 5000 ms |
+| Website: SSL verloopt binnen | 21 dagen | 7 dagen |
+| Website: 5xx-fouten | 5% | 20% |
+| Website: CPU (gem. 3 min) | 150% van 1 core | 300% van 1 core |
+| Website: 2 checks achter elkaar mislukt | – | onbereikbaar (kritiek) |
 | Bewaakte service niet actief | – | kritiek |
 | Andere gefaalde systemd-unit | waarschuwing | – |
 | Geen data > 180 s | – | offline (kritiek) |

@@ -227,6 +227,29 @@ td.actions .btn { margin-left: 4px; }
 .disk .bar { height: 8px; }
 .disk .sub { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
 
+/* ---------- websites ---------- */
+.site-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12.5px; }
+.site-stats div { display: flex; justify-content: space-between; gap: 6px; white-space: nowrap; }
+.site-stats span { color: var(--muted); }
+.site-stats b { font-weight: 500; font-variant-numeric: tabular-nums; }
+.site-stats b.warn { color: var(--warn); }
+.site-stats b.crit { color: #fca5a5; font-weight: 600; }
+.tile.big .site-stats { font-size: 14px; }
+.site-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.site-links a {
+  display: inline-flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--border); font-size: 13px;
+}
+.site-links a:hover { border-color: #35486b; }
+.site-links .dot { width: 8px; height: 8px; }
+.shares { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px 24px; }
+.share-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.share-head span { color: var(--muted); }
+.share-head b { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.share small { display: block; color: var(--muted); font-size: 12px; margin-top: 5px; line-height: 1.4; }
+.toplist td.cmd { max-width: 260px; }
+a.badge:hover { color: var(--text); border-color: #35486b; }
+
 /* ---------- dialogen ---------- */
 dialog {
   background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 12px;

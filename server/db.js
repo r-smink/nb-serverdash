@@ -55,6 +55,40 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS events_server ON events (server_id, ts);
 
+CREATE TABLE IF NOT EXISTS websites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  server_id INTEGER NOT NULL,
+  domain TEXT NOT NULL,
+  url TEXT NOT NULL DEFAULT '',
+  keyword TEXT NOT NULL DEFAULT '',
+  check_enabled INTEGER NOT NULL DEFAULT 1,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  last_stats TEXT,
+  last_stats_ts INTEGER,
+  last_check TEXT,
+  last_check_ts INTEGER,
+  fail_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS websites_server ON websites (server_id);
+
+CREATE TABLE IF NOT EXISTS site_metrics (
+  website_id INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  cpu REAL, rss REAL, rio REAL, wio REAL, procs INTEGER,
+  rpm REAL, bw REAL, s2 REAL, s3 REAL, s4 REAL, s5 REAL,
+  PRIMARY KEY (website_id, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS site_checks (
+  website_id INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  ok INTEGER NOT NULL,
+  status INTEGER,
+  ms REAL,
+  PRIMARY KEY (website_id, ts)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -128,6 +162,7 @@ export function deleteServer(id) {
     for (const table of ['metrics', 'proc_snapshots', 'events']) {
       db.prepare(`DELETE FROM ${table} WHERE server_id = ?`).run(id);
     }
+    for (const { id: wid } of db.prepare('SELECT id FROM websites WHERE server_id = ?').all(id)) deleteWebsiteRows(wid);
     db.prepare('DELETE FROM servers WHERE id = ?').run(id);
     db.exec('COMMIT');
   } catch (e) {
@@ -256,6 +291,96 @@ export const addEvent = (serverId, ts, level, message) => qAddEvent.run(serverId
 export const recentEvents = (limit = 30) => qRecentEvents.all(limit);
 export const serverEvents = (serverId, limit = 50) => qServerEvents.all(serverId, limit);
 
+// ---------- websites ----------
+
+const SITE_COLS = 'id, server_id, domain, url, keyword, check_enabled, notes, created_at, last_stats, last_stats_ts, last_check, last_check_ts, fail_count';
+const qListSites = db.prepare(`SELECT ${SITE_COLS} FROM websites ORDER BY domain`);
+const qGetSite = db.prepare(`SELECT ${SITE_COLS} FROM websites WHERE id = ?`);
+const qSitesForServer = db.prepare(`SELECT ${SITE_COLS} FROM websites WHERE server_id = ? ORDER BY domain`);
+const qInsertSite = db.prepare('INSERT INTO websites (server_id, domain, url, keyword, check_enabled, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+const qUpdateSite = db.prepare('UPDATE websites SET server_id = ?, domain = ?, url = ?, keyword = ?, check_enabled = ?, notes = ? WHERE id = ?');
+const qSiteStats = db.prepare('UPDATE websites SET last_stats = ?, last_stats_ts = ? WHERE id = ?');
+const qSiteCheck = db.prepare('UPDATE websites SET last_check = ?, last_check_ts = ?, fail_count = ? WHERE id = ?');
+const qInsertCheck = db.prepare('INSERT OR REPLACE INTO site_checks (website_id, ts, ok, status, ms) VALUES (?, ?, ?, ?, ?)');
+const SITE_METRIC_COLS = ['cpu', 'rss', 'rio', 'wio', 'procs', 'rpm', 'bw', 's2', 's3', 's4', 's5'];
+const qInsertSiteMetrics = db.prepare(
+  `INSERT OR REPLACE INTO site_metrics (website_id, ts, ${SITE_METRIC_COLS.join(', ')}) VALUES (?, ?, ${SITE_METRIC_COLS.map(() => '?').join(', ')})`);
+
+export const listWebsites = () => qListSites.all();
+export const getWebsite = (id) => qGetSite.get(id);
+export const websitesForServer = (serverId) => qSitesForServer.all(serverId);
+
+export function createWebsite(w) {
+  const { lastInsertRowid } = qInsertSite.run(w.server_id, w.domain, w.url, w.keyword, w.check_enabled ? 1 : 0, w.notes, nowSec());
+  return getWebsite(Number(lastInsertRowid));
+}
+
+export function updateWebsite(id, w) {
+  qUpdateSite.run(w.server_id, w.domain, w.url, w.keyword, w.check_enabled ? 1 : 0, w.notes, id);
+  return getWebsite(id);
+}
+
+function deleteWebsiteRows(id) {
+  for (const table of ['site_metrics', 'site_checks']) db.prepare(`DELETE FROM ${table} WHERE website_id = ?`).run(id);
+  db.prepare('DELETE FROM websites WHERE id = ?').run(id);
+}
+
+export function deleteWebsite(id) {
+  db.exec('BEGIN');
+  try { deleteWebsiteRows(id); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+
+export function insertSiteMetrics(id, ts, s) {
+  qInsertSiteMetrics.run(id, ts, ...SITE_METRIC_COLS.map((c) => num(s[c])));
+}
+export const setSiteStats = (id, ts, json) => qSiteStats.run(json, ts, id);
+export const setSiteCheck = (id, ts, json, failCount) => qSiteCheck.run(json, ts, failCount, id);
+export const insertCheck = (id, ts, ok, status, ms) => qInsertCheck.run(id, ts, ok ? 1 : 0, status ?? null, ms ?? null);
+
+const qRecentSite = db.prepare('SELECT ts, cpu, rpm, s5, s2, s3, s4 FROM site_metrics WHERE website_id = ? AND ts >= ? ORDER BY ts');
+export const recentSiteMetrics = (id, from) => qRecentSite.all(id, from);
+
+const qUptime = db.prepare('SELECT AVG(ok) * 100 AS up, COUNT(*) AS n FROM site_checks WHERE website_id = ? AND ts >= ?');
+export function uptimeSince(id, from) {
+  const r = qUptime.get(id, from);
+  return r.n ? Math.round(r.up * 100) / 100 : null;
+}
+
+function bucketed(sql, keys, params, bucket) {
+  const rows = db.prepare(sql).all(...params);
+  const out = { ts: [] };
+  for (const k of keys) out[k] = [];
+  const gap = Math.max(bucket * 3, 180);
+  let prev = null;
+  for (const row of rows) {
+    if (prev !== null && row.t - prev > gap) {
+      out.ts.push(prev + bucket);
+      for (const k of keys) out[k].push(null);
+    }
+    out.ts.push(row.t);
+    for (const k of keys) out[k].push(r2(row[k]));
+    prev = row.t;
+  }
+  return out;
+}
+
+export function querySiteMetrics(id, from, to, bucket) {
+  bucket = Math.max(1, Math.floor(bucket));
+  return bucketed(`
+    SELECT (ts / ${bucket}) * ${bucket} AS t, AVG(cpu) cpu, AVG(rss) rss, AVG(rio) rio, AVG(wio) wio, AVG(procs) procs,
+      AVG(rpm) rpm, AVG(bw) bw, AVG(s2) s2, AVG(s3) s3, AVG(s4) s4, AVG(s5) s5
+    FROM site_metrics WHERE website_id = ? AND ts >= ? AND ts <= ? GROUP BY t ORDER BY t`,
+  ['cpu', 'rss', 'rio', 'wio', 'procs', 'rpm', 'bw', 's2', 's3', 's4', 's5'], [id, from, to], bucket);
+}
+
+export function queryChecks(id, from, to, bucket) {
+  bucket = Math.max(60, Math.floor(bucket));
+  return bucketed(`
+    SELECT (ts / ${bucket}) * ${bucket} AS t, AVG(CASE WHEN ok = 1 THEN ms END) ms, AVG(ok) * 100 up
+    FROM site_checks WHERE website_id = ? AND ts >= ? AND ts <= ? GROUP BY t ORDER BY t`,
+  ['ms', 'up'], [id, from, to], bucket);
+}
+
 // ---------- onderhoud ----------
 
 export function purge() {
@@ -267,6 +392,12 @@ export function purge() {
   for (const { id } of db.prepare('SELECT id FROM servers').all()) {
     delMetrics.run(id, metricsBefore);
     delSnaps.run(id, snapsBefore);
+  }
+  const delSite = db.prepare('DELETE FROM site_metrics WHERE website_id = ? AND ts < ?');
+  const delChecks = db.prepare('DELETE FROM site_checks WHERE website_id = ? AND ts < ?');
+  for (const { id } of db.prepare('SELECT id FROM websites').all()) {
+    delSite.run(id, metricsBefore);
+    delChecks.run(id, metricsBefore);
   }
   db.prepare('DELETE FROM events WHERE ts < ?').run(now - 90 * 86400);
 }

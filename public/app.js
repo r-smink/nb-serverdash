@@ -94,13 +94,14 @@ function resetView() {
 function route() {
   resetView();
   const h = location.hash || '#/';
-  $$('.topbar nav a').forEach((a) => {
-    const href = a.getAttribute('href');
-    a.classList.toggle('active', href === '#/' ? h === '#/' || h.startsWith('#/server') : h.startsWith(href));
-  });
+  const section = h.startsWith('#/website') ? '#/websites' : h.startsWith('#/beheer') ? '#/beheer' : '#/';
+  $$('.topbar nav a').forEach((a) => a.classList.toggle('active', a.getAttribute('href') === section));
   window.scrollTo(0, 0);
-  const m = h.match(/^#\/server\/(\d+)/);
+  let m = h.match(/^#\/server\/(\d+)/);
   if (m) return renderDetail(+m[1]);
+  m = h.match(/^#\/website\/(\d+)/);
+  if (m) return renderWebsite(+m[1]);
+  if (h.startsWith('#/websites')) return renderWebsites();
   if (h.startsWith('#/beheer')) return renderAdmin();
   return renderOverview();
 }
@@ -191,7 +192,7 @@ function meter(label, value, text, lvl) {
   return `<div class="meter ${lvl}"><span class="ml">${label}</span><span class="bar"><i style="width:${w}%"></i></span><span class="mv">${text}</span></div>`;
 }
 
-function sparkSvg(vals) {
+function sparkSvg(vals, max = 100) {
   if (!vals || !vals.some((v) => v != null)) return '<div class="spark"></div>';
   const w = 300, h = 40, n = vals.length;
   let line = '', area = '', seg = [];
@@ -209,7 +210,7 @@ function sparkSvg(vals) {
       return;
     }
     gap = 0;
-    seg.push([((i / (n - 1)) * w).toFixed(1), (h - 1 - (Math.min(v, 100) / 100) * (h - 2)).toFixed(1)]);
+    seg.push([((i / (n - 1)) * w).toFixed(1), (h - 1 - (Math.min(v, max) / max) * (h - 2)).toFixed(1)]);
   });
   flush();
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="a" d="${area}"/><path class="l" d="${line}" vector-effect="non-scaling-stroke"/></svg>`;
@@ -273,7 +274,124 @@ const Y_FMT = {
   num: (v) => fmt.num(v, v < 10 ? 2 : 1),
   rate: fmt.rate,
   int: fmt.int,
+  ms: (v) => `${Math.round(v)} ms`,
+  bytes: fmt.bytes,
 };
+
+// ---------- gedeelde grafieken ----------
+
+/** Tekent (of ververst) een set grafieken in elementen #c-<key> .plot */
+function drawChartSet(defs, m, seriesFor, dataFor, opts) {
+  for (const def of defs) {
+    const box = $(`#c-${def.key}`);
+    if (!box) continue;
+    const plot = $('.plot', box);
+    const series = seriesFor(def, m);
+    const data = dataFor(def, m, series);
+    const sig = series.map((s) => s[0]).join('|');
+    const existing = view.charts.find((c) => c._key === def.key);
+    $('h4 span', box).textContent = m.bucket > 60 ? `gem. per ${fmt.dur(m.bucket)}` : '';
+
+    const remove = () => { if (existing) { existing.destroy(); view.charts.splice(view.charts.indexOf(existing), 1); } };
+    if (!data[0].length || !series.length) {
+      remove();
+      plot.innerHTML = '<div class="nodata">Geen data in deze periode</div>';
+      continue;
+    }
+    if (existing && existing._sig === sig) {
+      existing.setData(data);
+      continue;
+    }
+    remove();
+    plot.innerHTML = '';
+    const u = makeChart(plot, def, series, data, opts);
+    u._key = def.key;
+    u._sig = sig;
+    view.charts.push(u);
+  }
+}
+
+function makeChart(el, def, series, data, { syncKey, onZoom, onPick }) {
+  const yfmt = Y_FMT[def.y];
+  const axis = { stroke: '#8a97ad', grid: { stroke: '#ffffff0d', width: 1 }, ticks: { stroke: '#ffffff0d', width: 1 }, font: '11px Inter, Segoe UI, sans-serif' };
+  let down = null;
+  return new uPlot({
+    width: Math.max(300, el.clientWidth),
+    height: 200,
+    cursor: { sync: { key: syncKey }, drag: { x: true, y: false, setScale: false }, points: { size: 6 } },
+    scales: {
+      x: { time: true },
+      y: { range: def.max ? [0, def.max] : (_u, _min, max) => [0, max > 0 ? max * 1.15 : 1] },
+    },
+    axes: [
+      {
+        ...axis,
+        values: (self, vals) => {
+          const span = self.scales.x.max - self.scales.x.min;
+          const o = span > 2 * 86400 ? { day: '2-digit', month: '2-digit' }
+            : span > 86400 ? { weekday: 'short', hour: '2-digit', minute: '2-digit' } : { hour: '2-digit', minute: '2-digit' };
+          return vals.map((v) => new Date(v * 1000).toLocaleString('nl-NL', o));
+        },
+      },
+      { ...axis, size: 64, values: (_u, vals) => vals.map((v) => yfmt(v)) },
+    ],
+    series: [
+      { value: (_u, v) => (v == null ? '–' : fmt.time(v)) },
+      ...series.map(([, label, color, fill]) => ({
+        label, stroke: color, width: 1.6, fill: fill ? `${color}1f` : undefined,
+        value: (_u, v) => (v == null ? '–' : yfmt(v)), points: { show: false },
+        dash: label === 'Cores' ? [4, 4] : undefined,
+      })),
+    ],
+    hooks: {
+      setSelect: [(self) => {
+        if (self.select.width < 8) return;
+        const min = self.posToVal(self.select.left, 'x');
+        const max = self.posToVal(self.select.left + self.select.width, 'x');
+        self.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+        onZoom?.(min, max);
+      }],
+      ready: [(self) => {
+        self.over.addEventListener('mousedown', (e) => { down = [e.clientX, e.clientY]; });
+        self.over.addEventListener('mouseup', (e) => {
+          if (!down) return;
+          const moved = Math.abs(e.clientX - down[0]) > 4;
+          down = null;
+          const idx = self.cursor.idx;
+          if (moved || idx == null) return;
+          onPick?.(self.data[0][idx]);
+        });
+      }],
+    },
+  }, data, el);
+}
+
+function observeCharts(container) {
+  const ro = new ResizeObserver(() => {
+    for (const u of view.charts) {
+      const w = u.root.parentElement.clientWidth;
+      if (w && Math.abs(w - u.width) > 2) u.setSize({ width: w, height: 200 });
+    }
+  });
+  ro.observe(container);
+  view.cleanup.push(() => ro.disconnect());
+}
+
+function procRow(p) {
+  const cpuCls = p.cpu >= 80 ? 'hot' : p.cpu >= 30 ? 'warm' : '';
+  return `<tr>
+    <td class="num">${p.pid}</td>
+    <td>${esc(p.user)}</td>
+    <td class="num ${cpuCls}"><span class="cellbar"><i style="width:${Math.min(100, p.cpu)}%"></i></span>${fmt.pct(p.cpu, 1)}</td>
+    <td class="num">${fmt.bytes(p.rss)} <span class="muted">(${fmt.pct(p.mem, 1)})</span></td>
+    <td class="num">${p.rio ? fmt.rate(p.rio) : '–'}</td>
+    <td class="num">${p.wio ? fmt.rate(p.wio) : '–'}</td>
+    <td class="num">${fmt.dur(p.ctime)}</td>
+    <td class="num ${p.age > 3600 && p.cpu > 20 ? 'warm' : ''}">${fmt.dur(p.age)}</td>
+    <td class="num">${p.thr}</td>
+    <td class="cmd" title="${esc(p.cmd)}">${esc(p.cmd)}</td>
+  </tr>`;
+}
 
 const PROC_TABS = [
   ['cpu', 'CPU', (a, b) => b.cpu - a.cpu],
@@ -382,101 +500,17 @@ function renderDetail(id) {
     return [m.series.ts, ...series.map(([k]) => (k === 'cores' ? m.series.ts.map(() => m.cores) : m.series[k]))];
   }
 
-  function drawCharts(m) {
-    for (const def of CHART_DEFS) {
-      const box = $(`#c-${def.key}`);
-      const plot = $('.plot', box);
-      const series = seriesFor(def, m);
-      const data = dataFor(def, m, series);
-      const sig = series.map((s) => s[0]).join('|');
-      const existing = view.charts.find((c) => c._key === def.key);
-      $('h4 span', box).textContent = m.bucket > 60 ? `gem. per ${fmt.dur(m.bucket)}` : '';
-
-      if (!data[0].length) {
-        if (existing) { existing.destroy(); view.charts.splice(view.charts.indexOf(existing), 1); }
-        plot.innerHTML = '<div class="nodata">Geen data in deze periode</div>';
-        continue;
-      }
-      if (existing && existing._sig === sig) {
-        existing.setData(data);
-        continue;
-      }
-      if (existing) { existing.destroy(); view.charts.splice(view.charts.indexOf(existing), 1); }
-      plot.innerHTML = '';
-      const u = makeChart(plot, def, series, data);
-      u._key = def.key;
-      u._sig = sig;
-      view.charts.push(u);
-    }
-  }
-
-  function makeChart(el, def, series, data) {
-    const yfmt = Y_FMT[def.y];
-    const axis = { stroke: '#8a97ad', grid: { stroke: '#ffffff0d', width: 1 }, ticks: { stroke: '#ffffff0d', width: 1 }, font: '11px Inter, Segoe UI, sans-serif' };
-    let down = null;
-    const u = new uPlot({
-      width: Math.max(300, el.clientWidth),
-      height: 200,
-      cursor: { sync: { key: `sd-${id}` }, drag: { x: true, y: false, setScale: false }, points: { size: 6 } },
-      scales: {
-        x: { time: true },
-        y: { range: def.max ? [0, def.max] : (_u, _min, max) => [0, max > 0 ? max * 1.15 : 1] },
-      },
-      axes: [
-        {
-          ...axis,
-          values: (self, vals) => {
-            const span = self.scales.x.max - self.scales.x.min;
-            const opts = span > 2 * 86400 ? { day: '2-digit', month: '2-digit' }
-              : span > 86400 ? { weekday: 'short', hour: '2-digit', minute: '2-digit' } : { hour: '2-digit', minute: '2-digit' };
-            return vals.map((v) => new Date(v * 1000).toLocaleString('nl-NL', opts));
-          },
-        },
-        { ...axis, size: 64, values: (_u, vals) => vals.map((v) => yfmt(v)) },
-      ],
-      series: [
-        { value: (_u, v) => (v == null ? '–' : fmt.time(v)) },
-        ...series.map(([, label, color, fill]) => ({
-          label, stroke: color, width: 1.6, fill: fill ? `${color}1f` : undefined,
-          value: (_u, v) => (v == null ? '–' : yfmt(v)), points: { show: false },
-          dash: label === 'Cores' ? [4, 4] : undefined,
-        })),
-      ],
-      hooks: {
-        setSelect: [(self) => {
-          if (self.select.width < 8) return;
-          const min = self.posToVal(self.select.left, 'x');
-          const max = self.posToVal(self.select.left + self.select.width, 'x');
-          self.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
-          st.zoom = [min, max];
-          $('#resetZoom').classList.remove('hidden');
-          loadMetrics();
-        }],
-        ready: [(self) => {
-          self.over.addEventListener('mousedown', (e) => { down = [e.clientX, e.clientY]; });
-          self.over.addEventListener('mouseup', (e) => {
-            if (!down) return;
-            const moved = Math.abs(e.clientX - down[0]) > 4;
-            down = null;
-            const idx = self.cursor.idx;
-            if (moved || idx == null) return;
-            showSnapshot(self.data[0][idx]);
-          });
-        }],
-      },
-    }, data, el);
-    return u;
-  }
-
-  function resizeCharts() {
-    for (const u of view.charts) {
-      const w = u.root.parentElement.clientWidth;
-      if (w && Math.abs(w - u.width) > 2) u.setSize({ width: w, height: 200 });
-    }
-  }
-  const ro = new ResizeObserver(() => resizeCharts());
-  ro.observe($('#charts'));
-  view.cleanup.push(() => ro.disconnect());
+  const chartOpts = {
+    syncKey: `sd-${id}`,
+    onZoom: (min, max) => {
+      st.zoom = [min, max];
+      $('#resetZoom').classList.remove('hidden');
+      loadMetrics();
+    },
+    onPick: (ts) => showSnapshot(ts),
+  };
+  const drawCharts = (m) => drawChartSet(CHART_DEFS, m, seriesFor, dataFor, chartOpts);
+  observeCharts($('#charts'));
 
   async function showSnapshot(ts) {
     try {
@@ -534,22 +568,6 @@ function renderDetail(id) {
     if (live) live.onclick = () => { st.snap = null; drawProcs(); drawUsers(); };
   }
 
-  function procRow(p) {
-    const cpuCls = p.cpu >= 80 ? 'hot' : p.cpu >= 30 ? 'warm' : '';
-    return `<tr>
-      <td class="num">${p.pid}</td>
-      <td>${esc(p.user)}</td>
-      <td class="num ${cpuCls}"><span class="cellbar"><i style="width:${Math.min(100, p.cpu)}%"></i></span>${fmt.pct(p.cpu, 1)}</td>
-      <td class="num">${fmt.bytes(p.rss)} <span class="muted">(${fmt.pct(p.mem, 1)})</span></td>
-      <td class="num">${p.rio ? fmt.rate(p.rio) : '–'}</td>
-      <td class="num">${p.wio ? fmt.rate(p.wio) : '–'}</td>
-      <td class="num">${fmt.dur(p.ctime)}</td>
-      <td class="num ${p.age > 3600 && p.cpu > 20 ? 'warm' : ''}">${fmt.dur(p.age)}</td>
-      <td class="num">${p.thr}</td>
-      <td class="cmd" title="${esc(p.cmd)}">${esc(p.cmd)}</td>
-    </tr>`;
-  }
-
   function drawUsers() {
     const users = currentProcs()?.users || [];
     $('#usersPanel').innerHTML = `
@@ -600,13 +618,355 @@ function renderDetail(id) {
     ].filter(([, v]) => v);
     $('#infoPanel').innerHTML = `
       <div class="panel-head"><h3>Systeeminformatie</h3><div class="right"><a class="btn ghost small" href="#/beheer">Beheren</a></div></div>
-      <dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`;
+      <dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
+      <h3 style="margin-top:18px">Bewaakte websites</h3>
+      <div class="site-links">${(d.websites || []).map((w) => `
+        <a class="lvl-${w.level}" href="#/website/${w.id}"><span class="dot"></span>${esc(w.domain)}</a>`).join('')
+        || '<span class="muted">Geen — voeg ze toe via <a href="#/websites">Websites</a></span>'}</div>`;
 
     $('#eventList').innerHTML = eventsHtml(d.events, false) || '<li class="muted">Geen meldingen</li>';
   }
 
   loadInfo();
   loadMetrics();
+  view.timers.push(setInterval(() => {
+    loadInfo();
+    if (!st.zoom) loadMetrics();
+  }, 30_000));
+}
+
+// ---------- websites ----------
+
+let websitesData = null;
+
+function renderWebsites() {
+  const nav = view.nav;
+  main.innerHTML = `
+    <div class="toolbar">
+      <div class="summary" id="summary"></div>
+      <div class="filters">
+        <input id="search" type="search" placeholder="Zoek website…" value="${esc(prefs.siteSearch || '')}">
+        <select id="serverFilter" style="width:auto"><option value="">Alle servers</option></select>
+        <button class="btn" id="addSite">+ Website toevoegen</button>
+      </div>
+    </div>
+    <div class="grid sites" id="grid"><div class="empty">Laden…</div></div>`;
+
+  $('#search').oninput = (e) => { prefs.siteSearch = e.target.value; savePrefs(); drawWebsites(); };
+  $('#serverFilter').onchange = (e) => { prefs.siteServer = e.target.value; savePrefs(); drawWebsites(); };
+  $('#addSite').onclick = async () => {
+    if (!websitesData) return;
+    if (await websiteForm({}, websitesData.servers)) loadWebsites(nav);
+  };
+  if (websitesData) drawWebsites();
+  loadWebsites(nav);
+  view.timers.push(setInterval(() => loadWebsites(nav), 15_000));
+}
+
+async function loadWebsites(nav) {
+  try {
+    const d = await api('/websites');
+    if (nav !== view.nav) return;
+    websitesData = d;
+    drawWebsites();
+    setConn(true);
+  } catch (e) {
+    setConn(false, e.message);
+  }
+}
+
+function drawWebsites() {
+  const d = websitesData;
+  if (!d || !$('#grid')) return;
+  const sel = $('#serverFilter');
+  if (sel.options.length === 1) {
+    sel.insertAdjacentHTML('beforeend', [...d.servers].sort((a, b) => a.name.localeCompare(b.name, 'nl', { numeric: true }))
+      .map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join(''));
+    sel.value = prefs.siteServer || '';
+  }
+  const counts = { crit: 0, warn: 0, ok: 0, pending: 0, muted: 0 };
+  d.websites.forEach((w) => counts[w.status.level]++);
+  $('#summary').innerHTML = `
+    <span class="chip">${d.websites.length} websites</span>
+    <span class="chip crit ${counts.crit ? 'has' : ''}">${counts.crit} kritiek</span>
+    <span class="chip warn ${counts.warn ? 'has' : ''}">${counts.warn} waarschuwing</span>
+    <span class="chip ok">${counts.ok} OK</span>`;
+
+  const q = (prefs.siteSearch || '').toLowerCase();
+  const sid = +prefs.siteServer || 0;
+  const list = d.websites
+    .filter((w) => !sid || w.server_id === sid)
+    .filter((w) => !q || `${w.domain} ${w.server?.name || ''} ${w.notes} ${w.stats?.user || ''}`.toLowerCase().includes(q))
+    .sort((a, b) => LEVEL_RANK[b.status.level] - LEVEL_RANK[a.status.level] || (b.stats?.cpu || 0) - (a.stats?.cpu || 0)
+      || a.domain.localeCompare(b.domain));
+
+  $('#grid').innerHTML = list.length ? list.map((w) => siteTileHtml(w, d)).join('')
+    : `<div class="empty">${d.websites.length ? 'Geen websites die aan het filter voldoen.' : 'Nog geen websites. Klik op "+ Website toevoegen" om een site op een van de Plesk-servers te bewaken.'}</div>`;
+}
+
+const errPct = (s) => {
+  const total = s ? s.s2 + s.s3 + s.s4 + s.s5 : 0;
+  return total > 0 ? (s.s5 / total) * 100 : null;
+};
+
+function siteTileHtml(w, d) {
+  const th = d.thresholds, s = w.stats, c = w.check, lvl = w.status.level;
+  const big = d.enlarge && lvl === 'crit';
+  const issues = w.status.issues.filter((i) => i.level === 'crit' || i.level === 'warn');
+  const stat = (label, value, cls = '') => `<div><span>${label}</span><b class="${cls}">${value}</b></div>`;
+  const e5 = errPct(s);
+  const spMax = Math.max(1, ...w.spark.filter((v) => v != null));
+  return `
+    <a class="tile lvl-${lvl}${big ? ' big' : ''}" href="#/website/${w.id}">
+      <div class="tile-head"><span class="dot"></span><span class="tile-name">${esc(w.domain)}</span><span class="badge">${esc(w.server?.name || '?')}</span></div>
+      <div class="tile-host">${[s?.user && esc(s.user), s?.disk != null && `${fmt.bytes(s.disk)} op schijf`].filter(Boolean).join(' · ') || '&nbsp;'}</div>
+      ${issues.length ? `<ul class="issues">${issues.slice(0, big ? 6 : 2).map((i) => `<li class="${i.level}">${esc(i.msg)}</li>`).join('')}</ul>` : ''}
+      <div class="site-stats">
+        ${w.check_enabled ? stat('Respons', c?.ok ? `${c.ms} ms` : c ? 'down' : '–', c && !c.ok ? 'crit' : lvlFor(c?.ms, th.response))
+          + stat('Uptime', w.uptime24 == null ? '–' : fmt.pct(w.uptime24, w.uptime24 < 100 ? 2 : 0), w.uptime24 != null && w.uptime24 < 99 ? 'warn' : '') : ''}
+        ${stat('Req.', s?.found ? `${fmt.num(s.rpm, s.rpm < 10 ? 1 : 0)}/min` : '–')}
+        ${stat('Verkeer', s?.found ? fmt.rate(s.bw) : '–')}
+        ${stat('CPU', s?.found ? fmt.pct(s.cpu) : '–', lvlFor(s?.cpu, th.siteCpu))}
+        ${stat('RAM', s?.found ? fmt.bytes(s.rss) : '–')}
+      </div>
+      ${sparkSvg(w.spark, spMax * 1.1)}
+      <div class="tile-foot">
+        <span>5xx ${e5 == null ? '–' : fmt.pct(e5, 1)}</span>
+        <span>${c?.certDays != null ? `SSL ${c.certDays} d` : w.check_enabled ? '' : 'geen controle'}</span>
+      </div>
+    </a>`;
+}
+
+function websiteForm(w, servers) {
+  return new Promise((resolve) => {
+    const opts = [...servers].sort((a, b) => a.name.localeCompare(b.name, 'nl', { numeric: true }))
+      .map((s) => `<option value="${s.id}" ${s.id === w.server_id ? 'selected' : ''}>${esc(s.name)}${s.type !== 'plesk' ? ` (${TYPES[s.type] || s.type})` : ''}</option>`).join('');
+    const d = dialog(`
+      <form class="form" method="dialog">
+        <h3>${w.id ? 'Website bewerken' : 'Website toevoegen'}</h3>
+        <div class="row">
+          <label>Domein (zoals in Plesk)<input name="domain" required value="${esc(w.domain)}" placeholder="voorbeeld.nl"></label>
+          <label>Draait op server<select name="server_id" required><option value="">Kies…</option>${opts}</select></label>
+        </div>
+        <label>Controle-URL<input name="url" value="${esc(w.url)}" placeholder="Standaard: https://&lt;domein&gt;/"></label>
+        <div class="row">
+          <label>Sleutelwoord op de pagina (optioneel)<input name="keyword" value="${esc(w.keyword)}" placeholder="bijv. ©, Winkelwagen"></label>
+          <label class="check" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="check_enabled" ${w.check_enabled === false ? '' : 'checked'}> Bereikbaarheid elke minuut controleren</label>
+        </div>
+        <label>Notities<textarea name="notes" rows="2" maxlength="2000">${esc(w.notes)}</textarea></label>
+        <p class="note">CPU, geheugen, disk I/O, requests en schijfgebruik worden gemeten door de agent op de gekozen server
+          (versie 1.1 of nieuwer). De agent herkent de site aan de Plesk-systeemgebruiker en de PHP-FPM-pool van het domein,
+          en leest de logbestanden in <code>/var/www/vhosts/system/&lt;domein&gt;/logs</code>.</p>
+        <div class="form-error"></div>
+        <div class="actions">
+          <button class="btn ghost" value="cancel" formnovalidate>Annuleren</button>
+          <button class="btn" value="ok">${w.id ? 'Opslaan' : 'Toevoegen'}</button>
+        </div>
+      </form>`);
+    const form = $('form', d);
+    form.addEventListener('submit', async (e) => {
+      if (e.submitter?.value === 'cancel') return resolve(null);
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(form));
+      data.check_enabled = !!data.check_enabled;
+      data.server_id = +data.server_id;
+      try {
+        const res = w.id
+          ? await api(`/websites/${w.id}`, { method: 'PUT', body: data })
+          : await api('/websites', { method: 'POST', body: data });
+        d.close();
+        resolve(res);
+      } catch (ex) {
+        $('.form-error', d).textContent = ex.message;
+      }
+    });
+    d.addEventListener('cancel', () => resolve(null));
+  });
+}
+
+const SITE_CHARTS = [
+  { key: 'resp', title: 'Responstijd', y: 'ms', src: 'checks', check: true, series: [['ms', 'Responstijd', C.blue, true]] },
+  { key: 'up', title: 'Beschikbaarheid', y: 'pct', max: 100, src: 'checks', check: true, series: [['up', 'Bereikbaar', C.green, true]] },
+  { key: 'req', title: 'Requests per minuut', y: 'num', src: 'site', series: [['rpm', 'Totaal', C.blue, true], ['s4', '4xx', C.orange], ['s5', '5xx', C.red]] },
+  { key: 'bw', title: 'Bandbreedte (verzonden)', y: 'rate', src: 'site', series: [['bw', 'Verzonden', C.teal, true]] },
+  { key: 'scpu', title: 'CPU-gebruik van de site', y: 'pct', src: 'site', series: [['cpu', 'CPU (% van 1 core)', C.purple, true]] },
+  { key: 'smem', title: 'Geheugen van de site', y: 'bytes', src: 'site', series: [['rss', 'RAM', C.teal, true]] },
+  { key: 'sio', title: 'Disk I/O van de site', y: 'rate', src: 'site', series: [['rio', 'Lezen', C.blue, true], ['wio', 'Schrijven', C.pink, true]] },
+  { key: 'sprocs', title: 'Processen van de site', y: 'int', src: 'site', series: [['procs', 'Processen', C.purple, true]] },
+];
+
+function renderWebsite(id) {
+  const nav = view.nav;
+  const st = { range: prefs.range || 3600, zoom: null, info: null, servers: null };
+
+  main.innerHTML = `
+    <div id="dhead"></div>
+    <section class="panel share-panel" id="sharePanel" style="margin-top:0"></section>
+    <div class="toolbar" style="margin-top:16px">
+      <div class="seg" id="ranges">${RANGES.map(([l, r]) => `<button data-r="${r}" class="${r === st.range ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <button id="resetZoom" class="btn ghost small hidden">Zoom resetten</button>
+      <span class="hint">Sleep in een grafiek om in te zoomen</span>
+    </div>
+    <div class="charts" id="charts">${SITE_CHARTS.map((d) => `
+      <div class="chart" id="c-${d.key}"><h4>${d.title}<span></span></h4><div class="plot"></div></div>`).join('')}
+    </div>
+    <div class="cols3">
+      <section class="panel" id="pathsPanel"></section>
+      <section class="panel" id="ipsPanel"></section>
+      <section class="panel" id="agentsPanel"></section>
+    </div>
+    <section class="panel" id="sprocPanel"></section>
+    <section class="panel" id="sinfoPanel"></section>`;
+
+  $('#ranges').onclick = (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    st.range = +b.dataset.r;
+    prefs.range = st.range;
+    savePrefs();
+    $$('#ranges button').forEach((x) => x.classList.toggle('on', x === b));
+    st.zoom = null;
+    $('#resetZoom').classList.add('hidden');
+    loadMetrics();
+  };
+  $('#resetZoom').onclick = () => { st.zoom = null; $('#resetZoom').classList.add('hidden'); loadMetrics(); };
+
+  const chartOpts = {
+    syncKey: `site-${id}`,
+    onZoom: (min, max) => { st.zoom = [min, max]; $('#resetZoom').classList.remove('hidden'); loadMetrics(); },
+  };
+  observeCharts($('#charts'));
+
+  async function loadInfo() {
+    try {
+      const d = await api(`/websites/${id}`);
+      if (nav !== view.nav) return;
+      st.info = d;
+      draw(d);
+      setConn(true);
+    } catch (e) {
+      if (nav !== view.nav) return;
+      setConn(false, e.message);
+      if (!st.info) main.innerHTML = `<div class="empty">${esc(e.message)} — <a href="#/websites">terug naar websites</a></div>`;
+    }
+  }
+
+  async function loadMetrics() {
+    try {
+      const q = st.zoom ? `from=${Math.floor(st.zoom[0])}&to=${Math.ceil(st.zoom[1])}` : `range=${st.range}`;
+      const m = await api(`/websites/${id}/metrics?${q}`);
+      if (nav !== view.nav) return;
+      const defs = SITE_CHARTS.filter((c) => !c.check || st.info?.check_enabled !== false);
+      SITE_CHARTS.forEach((c) => $(`#c-${c.key}`).classList.toggle('hidden', !defs.includes(c)));
+      drawChartSet(defs, m, (def) => def.series, (def, mm, series) => [mm[def.src].ts, ...series.map(([k]) => mm[def.src][k])], chartOpts);
+    } catch (e) {
+      setConn(false, e.message);
+    }
+  }
+
+  function topList(title, rows, fmtKey) {
+    const total = rows.reduce((a, [, n]) => a + n, 0) || 1;
+    return `<h3>${title}</h3>
+      <table class="toplist"><tbody>${rows.map(([k, n]) => `
+        <tr><td class="cmd" title="${esc(k)}">${fmtKey ? fmtKey(k) : esc(k)}</td>
+        <td class="num"><span class="cellbar"><i style="width:${(n / rows[0][1]) * 100}%"></i></span>${n}</td>
+        <td class="num muted">${fmt.pct((n / total) * 100)}</td></tr>`).join('')
+        || '<tr><td class="muted">Geen requests in de laatste meting</td></tr>'}</tbody></table>`;
+  }
+
+  function draw(d) {
+    const s = d.fullStats, c = d.check, lvl = d.status.level, th = d.thresholds;
+    const issues = d.status.issues.filter((i) => i.level !== 'pending');
+    $('#dhead').innerHTML = `
+      <div class="dhead lvl-${lvl}">
+        <a href="#/websites" class="back" title="Terug">←</a>
+        <span class="dot"></span>
+        <h2>${esc(d.domain)}</h2>
+        <a class="badge" href="#/server/${d.server_id}">${esc(d.server?.name || '?')}</a>
+        <span class="lvl-label">${LEVEL_LABEL[lvl]}</span>
+        <div class="right" style="margin-left:auto;display:flex;gap:8px">
+          <a class="btn ghost small" href="${esc(d.url || `https://${d.domain}/`)}" target="_blank" rel="noopener noreferrer">Openen ↗</a>
+          ${d.check_enabled ? '<button class="btn ghost small" id="checkNow">Nu controleren</button>' : ''}
+          <button class="btn ghost small" id="editSite">Bewerken</button>
+          <button class="btn danger small" id="delSite">Verwijderen</button>
+        </div>
+      </div>
+      <div class="dsub">${[s?.user && `gebruiker ${esc(s.user)}`, s?.docroot && esc(s.docroot), d.stats_ts && `data ${fmt.ago(d.stats_ts)}`].filter(Boolean).join(' · ')}</div>
+      ${issues.length ? `<div class="alert ${d.status.real === 'crit' ? '' : 'warn'}"><ul class="issues">${issues.map((i) => `<li class="${i.level}">${esc(i.msg)}</li>`).join('')}</ul></div>` : ''}`;
+
+    const chk = $('#checkNow');
+    if (chk) chk.onclick = async () => {
+      chk.disabled = true;
+      chk.textContent = 'Bezig…';
+      try { await api(`/websites/${id}/check`, { method: 'POST', body: {} }); } catch (ex) { alert(ex.message); }
+      loadInfo();
+      loadMetrics();
+    };
+    $('#editSite').onclick = async () => {
+      if (!st.servers) st.servers = (await api('/websites')).servers;
+      if (await websiteForm(d, st.servers)) { loadInfo(); loadMetrics(); }
+    };
+    $('#delSite').onclick = async () => {
+      if (!confirm(`Website ${d.domain} niet meer bewaken en alle historie verwijderen?`)) return;
+      await api(`/websites/${id}`, { method: 'DELETE' });
+      location.hash = '#/websites';
+    };
+
+    // Wat vraagt de site van de server?
+    const si = d.serverInfo || {};
+    const cpuShare = s?.found && si.cores ? s.cpu / si.cores : null;
+    const memShare = s?.found && si.mem_total ? (s.rss / si.mem_total) * 100 : null;
+    const e5 = errPct(s);
+    const shareBar = (label, value, sub, cls) => `
+      <div class="share"><div class="share-head"><span>${label}</span><b>${value}</b></div>
+      ${sub}</div>`;
+    const bar = (pct, cls = '') => `<div class="bar ${cls}"><i style="width:${Math.min(100, pct || 0)}%"></i></div>`;
+    $('#sharePanel').innerHTML = `
+      <h3>Wat vraagt deze website van ${esc(d.server?.name || 'de server')}? <span class="muted" style="font-weight:400">· laatste meting</span></h3>
+      <div class="shares">
+        ${shareBar('CPU', s?.found ? fmt.pct(s.cpu, 1) : '–',
+          `${bar(cpuShare, lvlFor(s?.cpu, th.siteCpu))}<small>${cpuShare != null ? `${fmt.pct(cpuShare, 1)} van de totale servercapaciteit (${si.cores} cores) · server totaal ${fmt.pct(si.cpu)}` : 'van één core'}</small>`)}
+        ${shareBar('Geheugen', s?.found ? fmt.bytes(s.rss) : '–',
+          `${bar(memShare)}<small>${memShare != null ? `${fmt.pct(memShare, 1)} van ${fmt.bytes(si.mem_total)} RAM` : ''}</small>`)}
+        ${shareBar('Requests', s?.found ? `${fmt.num(s.rpm, 1)}/min` : '–',
+          `<small>2xx ${fmt.num(s?.s2, 1)} · 3xx ${fmt.num(s?.s3, 1)} · 4xx ${fmt.num(s?.s4, 1)} · 5xx ${fmt.num(s?.s5, 1)} per min${e5 != null ? ` (${fmt.pct(e5, 1)} fouten)` : ''}</small>`)}
+        ${shareBar('Bandbreedte', s?.found ? fmt.rate(s.bw) : '–', '<small>verzonden naar bezoekers</small>')}
+        ${shareBar('Disk I/O', s?.found ? fmt.rate(s.rio + s.wio) : '–', `<small>lezen ${fmt.rate(s?.rio)} · schrijven ${fmt.rate(s?.wio)}</small>`)}
+        ${shareBar('Schijfruimte', s?.disk != null ? fmt.bytes(s.disk) : '–', '<small>webruimte, elke 6 uur gemeten</small>')}
+        ${d.check_enabled ? shareBar('Responstijd', c?.ok ? `${c.ms} ms` : c ? 'down' : '–',
+          `<small>${c?.ttfb != null ? `TTFB ${c.ttfb} ms · ` : ''}uptime 24u ${fmt.pct(d.uptime24, 2)} · 7d ${fmt.pct(d.uptime7d, 2)} · 30d ${fmt.pct(d.uptime30d, 2)}</small>`) : ''}
+      </div>`;
+
+    $('#pathsPanel').innerHTML = topList("Populairste URL's", s?.paths || []);
+    $('#ipsPanel').innerHTML = topList('Meeste requests per IP', s?.ips || []);
+    $('#agentsPanel').innerHTML = topList('User-agents (bots herkennen)', s?.agents || []);
+
+    const procs = s?.top || [];
+    $('#sprocPanel').innerHTML = `
+      <div class="panel-head"><h3>Processen van deze site — live</h3><span class="muted">${s?.procs ?? 0} processen (PHP-FPM-pool, cron en scripts van ${esc(s?.user || 'de systeemgebruiker')})</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th class="num">PID</th><th>Gebruiker</th><th class="num">CPU</th><th class="num">Geheugen</th>
+            <th class="num">Lezen</th><th class="num">Schrijven</th><th class="num">CPU-tijd</th><th class="num">Looptijd</th>
+            <th class="num">Threads</th><th>Commando</th>
+          </tr></thead>
+          <tbody>${procs.map(procRow).join('') || '<tr><td colspan="10" class="muted">Geen processen actief</td></tr>'}</tbody>
+        </table>
+      </div>`;
+
+    const rows = [
+      ['Server', d.server && `${d.server.name} (${d.server.hostname})`], ['Systeemgebruiker', s?.user], ['Documentroot', s?.docroot],
+      ['Logbestand', s?.log && `${s.log}${s.log_truncated ? ' (te groot, deels overgeslagen)' : ''}`],
+      ['Controle-URL', d.check_enabled ? d.url : 'uitgeschakeld'], ['Sleutelwoord', d.keyword],
+      ['Laatste controle', c && `${c.ok ? 'OK' : 'MISLUKT'} · ${c.status ? `HTTP ${c.status} · ` : ''}${c.ms} ms${c.error ? ` · ${c.error}` : ''} · ${fmt.ago(d.check_ts)}`],
+      ['SSL-certificaat', c?.certValidTo && `${esc(c.certIssuer || '')} · geldig tot ${new Date(c.certValidTo * 1000).toLocaleDateString('nl-NL')} (${c.certDays} dagen)`],
+      ['Notities', d.notes],
+    ].filter(([, v]) => v);
+    $('#sinfoPanel').innerHTML = `<h3>Details</h3><dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`;
+  }
+
+  loadInfo().then(loadMetrics);
   view.timers.push(setInterval(() => {
     loadInfo();
     if (!st.zoom) loadMetrics();
@@ -758,6 +1118,8 @@ async function renderAdmin() {
       ['cpu', 'CPU-gebruik', '%, gemiddeld'], ['load', 'Load per core', 'load1 / cores, gemiddeld'],
       ['iowait', 'IO-wait', '%, gemiddeld'], ['mem', 'Geheugen', '% in gebruik'], ['swap', 'Swap', '%'],
       ['disk', 'Schijfruimte', '% per mount'], ['inodes', 'Inodes', '% per mount'], ['mailq', 'Mailwachtrij', 'aantal berichten'],
+      ['response', 'Website: responstijd', 'ms'], ['ssl', 'Website: SSL verloopt binnen', 'dagen (lager = slechter)'],
+      ['err5xx', 'Website: serverfouten', '% 5xx-responses'], ['siteCpu', 'Website: CPU', '% van één core, gemiddeld'],
     ];
     const t = s.thresholds;
     $('#thForm').innerHTML = `

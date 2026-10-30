@@ -11,6 +11,8 @@ Gebruik:
   nb-agent.py --once     verzamel en verstuur één meting (test)
   nb-agent.py --print    verzamel één meting en toon de JSON (niets versturen)
 """
+import collections
+import glob
 import json
 import os
 import platform
@@ -20,11 +22,12 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 CONF_FILE = os.environ.get('NB_AGENT_CONF', '/etc/nb-agent.conf')
 HZ = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
@@ -41,6 +44,12 @@ PHP_FPM_RE = re.compile(r'^(plesk-php\d+-fpm|php\d+\.\d+-fpm)$')
 MAILQ_DIRS = ['/var/spool/postfix/deferred', '/var/spool/postfix/active',
               '/var/spool/postfix/incoming', '/var/spool/postfix/maildrop']
 MAILQ_CAP = 100000
+VHOSTS = '/var/www/vhosts'
+DOMAIN_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+# Combined log format: ip - - [tijd] "METHOD pad HTTP/x" status bytes "referer" "user-agent"
+LOG_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]*\] "(?:\S+ (\S+)[^"]*|[^"]*)" (\d{3}) (\d+|-)(?: "[^"]*" "([^"]*)")?')
+LOG_MAX_BYTES = 20 * 1024 * 1024   # max. per logbestand per meting
+DU_INTERVAL = 6 * 3600
 
 
 def log(msg):
@@ -93,6 +102,13 @@ class Collector(object):
         self.enabled = set()
         self.enabled_at = 0
         self.cpu_model = self._cpu_model()
+        self.sites = []            # domeinen die het dashboard wil meten
+        self.last_rows = []
+        self.log_pos = {}          # logbestand -> (inode, offset)
+        self.site_info = {}        # domein -> (tijd, gebruiker, docroot)
+        self.du_cache = {}         # pad -> (tijd, bytes)
+        self.du_paths = []
+        self.du_busy = False
 
     # ---------- statische info ----------
 
@@ -278,6 +294,7 @@ class Collector(object):
                 'age': int(age), 'thr': threads, 'st': state,
             })
         self.prev_procs = cur
+        self.last_rows = rows
 
         # Selectie die we meesturen: zwaarste processen op verschillende assen.
         def top(key, n, cond=None):
@@ -352,6 +369,161 @@ class Collector(object):
                     return n
         return n
 
+    # ---------- websites (Plesk) ----------
+
+    def site_meta(self, domain):
+        """Systeemgebruiker en documentroot van een Plesk-domein (10 min gecachet)."""
+        cached = self.site_info.get(domain)
+        if cached and time.time() - cached[0] < 600:
+            return cached[1], cached[2]
+        user = docroot = None
+        try:
+            text = read(os.path.join(VHOSTS, 'system', domain, 'conf', 'last_httpd.conf'))
+            m = re.search(r'(?:SuexecUserGroup|AssignUserID)\s+"?([\w.-]+)', text)
+            if m:
+                user = m.group(1)
+            m = re.search(r'DocumentRoot\s+"?([^"\s]+)', text)
+            if m:
+                docroot = m.group(1)
+        except (IOError, OSError):
+            pass
+        if not user:
+            pools = glob.glob('/opt/plesk/php/*/etc/php-fpm.d/%s.conf' % domain) + glob.glob('/etc/php/*/fpm/pool.d/%s.conf' % domain)
+            for pool in pools:
+                try:
+                    m = re.search(r'^\s*user\s*=\s*(\S+)', read(pool), re.M)
+                    if m:
+                        user = m.group(1)
+                        break
+                except (IOError, OSError):
+                    pass
+        if not user:
+            try:
+                uid = os.stat(os.path.join(VHOSTS, domain)).st_uid
+                if uid:
+                    user = self.username(uid)
+            except OSError:
+                pass
+        self.site_info[domain] = (time.time(), user, docroot)
+        return user, docroot
+
+    def read_new_lines(self, path):
+        """Nieuwe regels sinds de vorige meting. De eerste keer begint hij aan het eind."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return [], False
+        prev = self.log_pos.get(path)
+        if prev is None:
+            self.log_pos[path] = (st.st_ino, st.st_size)
+            return [], False
+        ino, pos = prev
+        if st.st_ino != ino or st.st_size < pos:   # logrotatie
+            pos = 0
+        truncated = st.st_size - pos > LOG_MAX_BYTES
+        if truncated:
+            pos = st.st_size - LOG_MAX_BYTES
+        with open(path, 'rb') as fh:
+            fh.seek(pos)
+            data = fh.read(st.st_size - pos)
+        end = data.rfind(b'\n')
+        if end < 0:
+            self.log_pos[path] = (st.st_ino, pos)
+            return [], truncated
+        self.log_pos[path] = (st.st_ino, pos + end + 1)
+        return data[:end].decode('utf-8', 'replace').splitlines(), truncated
+
+    def log_stats(self, domain, dt):
+        logdir = os.path.join(VHOSTS, 'system', domain, 'logs')
+        # nginx (proxy_*) ziet alle requests, ook statische bestanden; anders de Apache-logs
+        files = [os.path.join(logdir, f) for f in ('proxy_access_ssl_log', 'proxy_access_log')]
+        if not any(os.path.exists(f) for f in files):
+            files = [os.path.join(logdir, f) for f in ('access_ssl_log', 'access_log')]
+        req = size = 0
+        status = [0, 0, 0, 0]
+        paths = collections.Counter()
+        ips = collections.Counter()
+        agents = collections.Counter()
+        truncated = False
+        for f in files:
+            lines, trunc = self.read_new_lines(f)
+            truncated = truncated or trunc
+            for line in lines:
+                m = LOG_RE.match(line)
+                if not m:
+                    continue
+                req += 1
+                code = int(m.group(3))
+                if 200 <= code < 600:
+                    status[code // 100 - 2] += 1
+                if m.group(4) != '-':
+                    size += int(m.group(4))
+                ips[m.group(1)] += 1
+                if m.group(2):
+                    paths[m.group(2).split('?', 1)[0][:200]] += 1
+                if m.group(5):
+                    agents[m.group(5)[:160]] += 1
+        per_min = 60.0 / dt if dt > 0 else 0
+        return {
+            'req': req, 'rpm': round(req * per_min, 1), 'bw': round(size / dt) if dt > 0 else 0,
+            's2': round(status[0] * per_min, 1), 's3': round(status[1] * per_min, 1),
+            's4': round(status[2] * per_min, 1), 's5': round(status[3] * per_min, 1),
+            'paths': paths.most_common(15), 'ips': ips.most_common(15), 'agents': agents.most_common(8),
+            'log': os.path.basename(files[0]).replace('_ssl', ''), 'log_truncated': truncated,
+        }
+
+    def _du_worker(self, paths):
+        try:
+            for p in paths:
+                out = run(['nice', '-n', '19', 'ionice', '-c3', 'du', '-sb', p], timeout=900)
+                try:
+                    self.du_cache[p] = (time.time(), int(out.split()[0]))
+                except (IndexError, ValueError):
+                    self.du_cache[p] = (time.time(), None)
+        finally:
+            self.du_busy = False
+
+    def refresh_disk_usage(self):
+        """Start op de achtergrond `du` voor sites waarvan de meting ouder is dan 6 uur."""
+        now = time.time()
+        stale = [p for p in self.du_paths if now - self.du_cache.get(p, (0, None))[0] > DU_INTERVAL]
+        if stale and not self.du_busy:
+            self.du_busy = True
+            t = threading.Thread(target=self._du_worker, args=(stale,))
+            t.daemon = True
+            t.start()
+
+    def site_stats(self, dt):
+        out = {}
+        du_paths = []
+        for domain in [d for d in self.sites if DOMAIN_RE.match(d)]:
+            if not os.path.isdir(os.path.join(VHOSTS, 'system', domain)):
+                out[domain] = {'found': False}
+                continue
+            user, docroot = self.site_meta(domain)
+            pool = 'pool %s' % domain
+            procs = [r for r in self.last_rows
+                     if r['cmd'].endswith(pool) or (pool + ' ') in r['cmd']
+                     or (user and r['user'] == user and 'php-fpm: pool' not in r['cmd'])]
+            home = os.path.join(VHOSTS, domain)
+            disk_path = home if os.path.isdir(home) and not os.path.islink(home) else docroot
+            if disk_path:
+                du_paths.append(disk_path)
+            stats = {
+                'found': True, 'user': user, 'docroot': docroot,
+                'cpu': round(sum(r['cpu'] for r in procs), 1),
+                'rss': sum(r['rss'] for r in procs),
+                'rio': sum(r['rio'] for r in procs), 'wio': sum(r['wio'] for r in procs),
+                'procs': len(procs),
+                'top': sorted(procs, key=lambda r: (r['cpu'], r['rss']), reverse=True)[:15],
+                'disk': self.du_cache.get(disk_path, (0, None))[1] if disk_path else None,
+            }
+            stats.update(self.log_stats(domain, dt))
+            out[domain] = stats
+        self.du_paths = du_paths
+        self.refresh_disk_usage()
+        return out
+
     # ---------- alles samen ----------
 
     def collect(self):
@@ -408,6 +580,8 @@ class Collector(object):
             'failed': failed,
             'mailq': self.mailq(),
         }
+        if self.sites:
+            payload['sites'] = self.site_stats(dt)
         self.prev_t, self.prev_cpu, self.prev_disk, self.prev_net = now, cpu_t, disk_t, net_t
         return payload
 
@@ -424,7 +598,10 @@ def send(conf, payload):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
-        return r.status
+        try:
+            return json.loads(r.read().decode('utf-8') or '{}')
+        except ValueError:
+            return {}
 
 
 def main():
@@ -451,8 +628,10 @@ def main():
         queue = queue[-20:]        # max 20 metingen bufferen bij storing
         while queue:
             try:
-                send(conf, queue[0])
+                resp = send(conf, queue[0])
                 queue.pop(0)
+                if isinstance(resp.get('sites'), list):
+                    collector.sites = [str(d).lower() for d in resp['sites']][:200]
             except urllib.error.HTTPError as e:
                 log('dashboard antwoordde HTTP %s: %s' % (e.code, e.read()[:200]))
                 if e.code in (400, 401, 403, 413):
