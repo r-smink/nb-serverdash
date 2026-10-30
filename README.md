@@ -80,6 +80,11 @@ npm run demo:clean          # demo-servers weer verwijderen
 
 ## Productie-installatie (dashboard)
 
+**Aanbevolen: Docker op een DigitalOcean-droplet.** Volg de stap-voor-stap-handleiding in
+[docs/DEPLOY-DIGITALOCEAN.md](docs/DEPLOY-DIGITALOCEAN.md) (Docker + Caddy met automatisch HTTPS, back-ups, updaten).
+
+Zonder Docker kan het ook direct met Node.js en systemd:
+
 Bijvoorbeeld op een kleine aparte VPS. Zet het dashboard bij voorkeur niet op een van de bewaakte servers:
 als die uitvalt, wil je dat nog kunnen zien.
 

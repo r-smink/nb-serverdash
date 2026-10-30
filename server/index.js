@@ -145,3 +145,16 @@ every(60_000, 'heartbeat', async () => {
 server.listen(config.port, config.host, () => {
   console.log(`ServerDash draait op http://${config.host}:${config.port}`);
 });
+
+// Netjes afsluiten bij `docker stop` / systemctl stop: lopende requests afronden en de database sluiten.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.once(sig, () => {
+    console.log(`${sig} ontvangen, afsluiten…`);
+    server.close(() => {
+      try { store.db.close(); } catch { /* al gesloten */ }
+      process.exit(0);
+    });
+    server.closeIdleConnections?.();
+    setTimeout(() => process.exit(0), 5000).unref();
+  });
+}

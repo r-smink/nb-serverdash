@@ -1,0 +1,9 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy serverdash:8080
+	header Strict-Transport-Security "max-age=31536000"
+}

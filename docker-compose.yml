@@ -1,0 +1,46 @@
+# ServerDash + Caddy (automatisch HTTPS via Let's Encrypt).
+# Starten:  docker compose up -d --build
+services:
+  serverdash:
+    build: .
+    image: nb-serverdash:latest
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATA_DIR: /app/data
+      TRUST_PROXY: "1"
+      SECURE_COOKIE: "1"
+    volumes:
+      - ./data:/app/data
+    # Geen 'ports': alleen Caddy is van buitenaf bereikbaar.
+    expose:
+      - "8080"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [serverdash]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?Zet DOMAIN in .env, bijv. monitor.nextbuzz.nl}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  caddy_data:
+  caddy_config:

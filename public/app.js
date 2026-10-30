@@ -172,7 +172,7 @@ function renderOverview() {
         </div>
       </div>
     </div>
-    <div class="grid" id="grid"><div class="empty">Laden…</div></div>
+    <div class="tile-groups" id="grid"><div class="empty">Laden…</div></div>
     <section class="panel"><h3>Recente meldingen</h3><ul class="events" id="events"></ul></section>`;
 
   $('#search').oninput = (e) => { prefs.search = e.target.value; savePrefs(); drawOverview(); };
@@ -223,11 +223,20 @@ function drawOverview() {
     .sort((a, b) => LEVEL_RANK[b.status.level] - LEVEL_RANK[a.status.level] || a.name.localeCompare(b.name, 'nl', { numeric: true }));
 
   $('#grid').innerHTML = list.length
-    ? list.map((s) => tileHtml(s, d)).join('')
+    ? tileGroups(list, (s) => tileHtml(s, d))
     : `<div class="empty">${d.servers.length ? 'Geen servers die aan het filter voldoen.' : 'Nog geen servers. <a href="#/beheer">Voeg je eerste server toe</a>.'}</div>`;
 
   $('#events').innerHTML = eventsHtml(d.events, true) || '<li class="muted">Nog geen meldingen</li>';
   document.title = counts.crit ? `(${counts.crit}) ServerDash` : 'ServerDash';
+}
+
+// Kritieke tegels bovenaan in een eigen rij van 3, de rest (oranje, groen, wachtend) daaronder 4 op een rij.
+function tileGroups(list, render) {
+  const crit = list.filter((x) => x.status.level === 'crit');
+  const order = { warn: 0, ok: 1, pending: 2, muted: 3 };
+  const rest = list.filter((x) => x.status.level !== 'crit').sort((a, b) => order[a.status.level] - order[b.status.level]);
+  return (crit.length ? `<div class="grid grid-crit">${crit.map(render).join('')}</div>` : '')
+    + (rest.length ? `<div class="grid grid-rest">${rest.map(render).join('')}</div>` : '');
 }
 
 function meter(label, value, text, lvl) {
@@ -817,7 +826,7 @@ function renderWebsites() {
         <button class="btn admin-only" id="addSite">+ Website toevoegen</button>
       </div>
     </div>
-    <div class="grid sites" id="grid"><div class="empty">Laden…</div></div>`;
+    <div class="tile-groups sites" id="grid"><div class="empty">Laden…</div></div>`;
 
   $('#search').oninput = (e) => { prefs.siteSearch = e.target.value; savePrefs(); drawWebsites(); };
   $('#serverFilter').onchange = (e) => { prefs.siteServer = e.target.value; savePrefs(); drawWebsites(); };
@@ -870,7 +879,7 @@ function drawWebsites() {
     .sort((a, b) => LEVEL_RANK[b.status.level] - LEVEL_RANK[a.status.level] || (b.stats?.cpu || 0) - (a.stats?.cpu || 0)
       || a.domain.localeCompare(b.domain));
 
-  $('#grid').innerHTML = list.length ? list.map((w) => siteTileHtml(w, d)).join('')
+  $('#grid').innerHTML = list.length ? tileGroups(list, (w) => siteTileHtml(w, d))
     : `<div class="empty">${d.websites.length ? 'Geen websites die aan het filter voldoen.' : 'Nog geen websites. Klik op "+ Website toevoegen" om een site op een van de Plesk-servers te bewaken.'}</div>`;
 }
 
