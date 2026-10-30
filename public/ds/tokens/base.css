@@ -1,0 +1,58 @@
+/* ==========================================================================
+   Next Buzz — Base element defaults & a few helpers.
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  line-height: var(--leading-normal);
+  color: var(--text-default);
+  background: var(--surface-page);
+  font-weight: var(--weight-regular);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, h4, h5 {
+  font-family: var(--font-heading);
+  color: var(--text-strong);
+  font-weight: var(--weight-bold);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+  margin: 0;
+  text-wrap: balance;
+}
+
+p { margin: 0; text-wrap: pretty; }
+
+a { color: var(--text-link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+::selection { background: var(--red-500); color: var(--white); }
+
+:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--focus-ring) 55%, transparent);
+  outline-offset: 2px;
+}
+
+/* ---- Helpers ---------------------------------------------------------- */
+.nb-eyebrow {
+  font-family: var(--font-body);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-overline);
+  letter-spacing: var(--tracking-overline);
+  text-transform: uppercase;
+  color: var(--color-primary);
+}
+
+.nb-container {
+  width: 100%;
+  max-width: var(--container-max);
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}

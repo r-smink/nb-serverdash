@@ -1,0 +1,7 @@
+/* ==========================================================================
+   Next Buzz — Fonts
+   Headings: Schibsted Grotesk · Body: Hanken Grotesk (both Google Fonts).
+   NOTE: served from Google Fonts CDN — see readme for self-hosting note.
+   ========================================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800;900&family=Hanken+Grotesk:wght@400;500;600;700;800&display=swap');

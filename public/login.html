@@ -5,21 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inloggen — ServerDash</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/ds/styles.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body class="login-page">
   <form id="login" class="login-box">
-    <div class="brand"><span class="logo"></span>ServerDash</div>
+    <div class="brand"><span class="logo" role="img" aria-label="Next Buzz"></span>ServerDash</div>
+    <p class="lead">Log in om de serverhealth te bekijken.</p>
     <div id="step1">
       <label>Gebruikersnaam<input name="username" autocomplete="username" required autofocus></label>
-      <label style="margin-top:14px">Wachtwoord<input name="password" type="password" autocomplete="current-password" required></label>
+      <label style="margin-top:16px">Wachtwoord<input name="password" type="password" autocomplete="current-password" required></label>
     </div>
     <div id="step2" class="hidden">
       <p class="note">Voer de 6-cijferige code uit je authenticator-app in.</p>
-      <label>Verificatiecode<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7"></label>
+      <label style="margin-top:12px">Verificatiecode<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7"></label>
     </div>
     <div id="err" class="form-error"></div>
-    <button class="btn" type="submit">Inloggen</button>
+    <button class="btn block" type="submit">Inloggen <span class="arrow" aria-hidden="true">→</span></button>
+    <p class="foot">Next Buzz · ServerDash</p>
   </form>
   <script src="/login.js"></script>
 </body>

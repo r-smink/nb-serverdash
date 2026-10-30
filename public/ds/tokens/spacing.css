@@ -1,0 +1,24 @@
+/* ==========================================================================
+   Next Buzz — Spacing & layout tokens
+   8px base rhythm.
+   ========================================================================== */
+
+:root {
+  --space-0:  0;
+  --space-1:  0.25rem;  /* 4 */
+  --space-2:  0.5rem;   /* 8 */
+  --space-3:  0.75rem;  /* 12 */
+  --space-4:  1rem;     /* 16 */
+  --space-5:  1.5rem;   /* 24 */
+  --space-6:  2rem;     /* 32 */
+  --space-7:  3rem;     /* 48 */
+  --space-8:  4rem;     /* 64 */
+  --space-9:  6rem;     /* 96 */
+  --space-10: 8rem;     /* 128 */
+
+  /* ---- Layout --------------------------------------------------------- */
+  --container-max: 1240px;
+  --container-narrow: 760px;
+  --gutter: clamp(1.25rem, 0.5rem + 3vw, 3rem); /* @kind spacing */
+  --section-y: clamp(4rem, 2rem + 7vw, 8rem); /* @kind spacing */
+}

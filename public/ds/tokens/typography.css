@@ -1,0 +1,44 @@
+/* ==========================================================================
+   Next Buzz — Typography tokens
+   Display/headings in Schibsted Grotesk, body in Hanken Grotesk.
+   ========================================================================== */
+
+:root {
+  /* ---- Families ------------------------------------------------------- */
+  --font-heading: 'Schibsted Grotesk', 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body:    'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono:    ui-monospace, 'SF Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+
+  /* ---- Type scale (fluid-friendly base, 1.25 ratio-ish) --------------- */
+  --text-display:  4.5rem;   /* 72 hero (use a local clamp() for fluid scaling) */
+  --text-h1:       3rem;     /* 48 */
+  --text-h2:       2.25rem;  /* 36 */
+  --text-h3:       1.5rem;   /* 24 */
+  --text-h4:       1.25rem;  /* 20 */
+  --text-lead:     1.25rem;  /* 20 intro paragraph */
+  --text-body:     1.0625rem;/* 17 */
+  --text-sm:       0.9375rem;/* 15 */
+  --text-xs:       0.8125rem;/* 13 labels */
+  --text-overline: 0.75rem;  /* 12 eyebrow */
+
+  /* ---- Weights -------------------------------------------------------- */
+  --weight-regular:  400;
+  --weight-medium:   500;
+  --weight-semibold: 600;
+  --weight-bold:     700;
+  --weight-extra:    800;
+  --weight-black:    900;
+
+  /* ---- Line heights --------------------------------------------------- */
+  --leading-tight:   1.04;
+  --leading-snug:    1.18;
+  --leading-normal:  1.5;
+  --leading-relaxed: 1.65;
+
+  /* ---- Letter spacing ------------------------------------------------- */
+  --tracking-tight:   -0.02em;
+  --tracking-snug:    -0.01em;
+  --tracking-normal:  0;
+  --tracking-wide:    0.04em;
+  --tracking-overline:0.14em; /* uppercase eyebrows */
+}

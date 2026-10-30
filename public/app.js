@@ -12,8 +12,8 @@ const TYPES = { plesk: 'Plesk', nameserver: 'Nameserver', database: 'Database', 
 const LEVEL_RANK = { crit: 4, warn: 3, pending: 2, ok: 1, muted: 0 };
 const LEVEL_LABEL = { crit: 'Kritiek', warn: 'Waarschuwing', pending: 'Wacht op data', ok: 'OK', muted: 'Gepauzeerd' };
 const C = {
-  blue: '#4c9aff', green: '#22c55e', purple: '#a78bfa', orange: '#f59e0b', red: '#ef4444',
-  teal: '#14b8a6', pink: '#f472b6', grey: '#64748b', yellow: '#facc15', cyan: '#38bdf8',
+  blue: '#2A6FDB', green: '#1F9D55', purple: '#7C5CD6', orange: '#E8A317', red: '#E22830',
+  teal: '#14A098', pink: '#D9468F', grey: '#9B9B98', yellow: '#C9A100', cyan: '#2BA3D9',
 };
 const PALETTE = [C.blue, C.green, C.orange, C.purple, C.teal, C.pink, C.yellow, C.red, C.cyan];
 
@@ -141,6 +141,11 @@ async function updateIncidentBadge() {
   } catch { /* volgende keer opnieuw */ }
 }
 
+/* global toggleTheme */
+$('#themeToggle').onclick = toggleTheme;
+// Grafieken lezen hun as-kleuren bij het tekenen; na een themawissel opnieuw tekenen.
+window.addEventListener('themechange', () => { if (view.charts.length) route(); });
+
 $('#logout').onclick = async () => {
   await api('/logout', { method: 'POST', body: {} }).catch(() => {});
   location.href = '/login.html';
@@ -154,8 +159,11 @@ function renderOverview() {
   const nav = view.nav;
   const filter = prefs.filter || 'all';
   main.innerHTML = `
+    <div class="page-head">
+      <div><h1>Overzicht</h1><p>Plesk-, nameserver- en databaseservers — realtime.</p></div>
+      <div class="right summary" id="summary"></div>
+    </div>
     <div class="toolbar">
-      <div class="summary" id="summary"></div>
       <div class="filters">
         <input id="search" type="search" placeholder="Zoek server…" value="${esc(prefs.search || '')}">
         <div class="seg" id="typeFilter">
@@ -350,7 +358,12 @@ function drawChartSet(defs, m, seriesFor, dataFor, opts) {
 
 function makeChart(el, def, series, data, { syncKey, onZoom, onPick }) {
   const yfmt = Y_FMT[def.y];
-  const axis = { stroke: '#8a97ad', grid: { stroke: '#ffffff0d', width: 1 }, ticks: { stroke: '#ffffff0d', width: 1 }, font: '11px Inter, Segoe UI, sans-serif' };
+  const css = getComputedStyle(document.documentElement);
+  const gridCol = css.getPropertyValue('--chart-grid').trim();
+  const axis = {
+    stroke: css.getPropertyValue('--chart-axis').trim(), grid: { stroke: gridCol, width: 1 }, ticks: { stroke: gridCol, width: 1 },
+    font: "11px 'Hanken Grotesk', Segoe UI, sans-serif",
+  };
   let down = null;
   return new uPlot({
     width: Math.max(300, el.clientWidth),
@@ -594,7 +607,7 @@ function renderDetail(id) {
         ${procs ? `<span class="muted">${procs.total} processen, ${procs.running} actief</span>` : ''}
         <div class="right">
           ${st.snap ? '<button class="btn small" id="liveBtn">Terug naar live</button>' : ''}
-          <div class="seg" id="procTabs">${PROC_TABS.map(([k, l]) => `<button data-k="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</div>
+          <div class="seg tabs" id="procTabs">${PROC_TABS.map(([k, l]) => `<button data-k="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</div>
         </div>
       </div>
       ${tab === 'long' ? '<p class="note">Processen die langer dan 10 minuten draaien en CPU of disk gebruiken, gesorteerd op looptijd.</p>' : ''}
@@ -792,8 +805,11 @@ let websitesData = null;
 function renderWebsites() {
   const nav = view.nav;
   main.innerHTML = `
+    <div class="page-head">
+      <div><h1>Websites</h1><p>Bereikbaarheid, verkeer en serverbelasting per site.</p></div>
+      <div class="right summary" id="summary"></div>
+    </div>
     <div class="toolbar">
-      <div class="summary" id="summary"></div>
       <div class="filters">
         <input id="search" type="search" placeholder="Zoek website…" value="${esc(prefs.siteSearch || '')}">
         <select id="serverFilter" style="width:auto"><option value="">Alle servers</option></select>
@@ -1220,6 +1236,7 @@ function showInstall(name, res) {
 async function renderAdmin() {
   const nav = view.nav;
   main.innerHTML = `
+    <div class="page-head"><div><h1>Beheer</h1><p>Servers en websites toevoegen, pauzeren, drempelwaarden, meldingen en gebruikers.</p></div></div>
     <section class="panel" style="margin-top:0">
       <div class="panel-head"><h3>Servers</h3><div class="right"><button class="btn" id="addBtn">+ Server toevoegen</button></div></div>
       <div class="table-wrap" id="srvTable"><p class="muted">Laden…</p></div>
@@ -1329,7 +1346,7 @@ async function renderAdmin() {
       for (const [k] of rows) thresholds[k] = { warn: +fd.get(`${k}.warn`), crit: +fd.get(`${k}.crit`) };
       try {
         await api('/settings', { method: 'PUT', body: { thresholds, enlargeProblems: fd.get('enlargeProblems') === 'on' } });
-        $('#thMsg').style.color = '#86efac';
+        $('#thMsg').style.color = 'var(--success-500)';
         $('#thMsg').textContent = 'Opgeslagen ✓';
       } catch (ex) {
         $('#thMsg').style.color = '';

@@ -44,8 +44,8 @@ function renderUsage() {
   const nav = view.nav;
   const st = { range: prefs.usageRange || 604800, tab: prefs.usageTab || 'users', onlySubs: prefs.onlySubs !== false, data: null };
   main.innerHTML = `
+    <div class="page-head"><div><h1>Top-verbruikers</h1><p>Welke abonnementen de meeste resources gebruiken — kandidaten voor een groter pakket of een rustigere server.</p></div></div>
     <div class="toolbar">
-      <h2 style="margin-right:12px">Top-verbruikers</h2>
       ${segHtml('uRange', [[86400, '24u'], [604800, '7 dagen'], [2592000, '30 dagen']], st.range)}
       ${segHtml('uTab', [['users', 'Abonnementen'], ['domains', 'Domeinen'], ['servers', 'Servers']], st.tab)}
       <label class="check" id="subsWrap"><input type="checkbox" id="onlySubs" ${st.onlySubs ? 'checked' : ''}> Alleen klantabonnementen</label>
@@ -130,6 +130,7 @@ function renderMaintenance() {
   const nav = view.nav;
   const st = { data: null, wpOnlyOutdated: prefs.wpOnlyOutdated !== false, wpSearch: '' };
   main.innerHTML = `
+    <div class="page-head"><div><h1>Onderhoud</h1><p>Back-ups, updates, schijfvoorspelling en WordPress-versies.</p></div></div>
     <section class="panel" style="margin-top:0" id="bkPanel"><p class="muted">Laden…</p></section>
     <section class="panel" id="updPanel"></section>
     <section class="panel" id="fcPanel"></section>
@@ -267,7 +268,7 @@ function renderSecurity() {
   const nav = view.nav;
   const st = { range: prefs.secRange || 86400 };
   main.innerHTML = `
-    <div class="toolbar"><h2 style="margin-right:12px">Beveiliging</h2>${segHtml('sRange', [[86400, '24u'], [604800, '7 dagen']], st.range)}</div>
+    <div class="page-head"><div><h1>Beveiliging</h1><p>Fail2ban, mislukte logins en aanvallen op wp-login &amp; xmlrpc.</p></div><div class="right">${segHtml('sRange', [[86400, '24u'], [604800, '7 dagen']], st.range)}</div></div>
     <div class="charts" id="charts" style="grid-template-columns:1fr">
       <div class="chart" id="c-attacks"><h4>Aanvallen en geblokkeerde verzoeken per uur — alle servers, 7 dagen<span></span></h4><div class="plot"></div></div>
     </div>
@@ -337,11 +338,9 @@ function renderIncidents() {
   const nav = view.nav;
   const st = { filter: prefs.incFilter || 'open', range: 30 * 86400 };
   main.innerHTML = `
-    <div class="toolbar">
-      <h2 style="margin-right:12px">Incidenten</h2>
-      ${segHtml('iFilter', [['open', 'Open'], ['30', '30 dagen'], ['90', '90 dagen']], st.filter)}
-      <span class="hint">Een incident opent automatisch zodra een server of website een waarschuwing of kritieke status krijgt, en sluit bij herstel.
-        Bevestigen stopt de herhaalmeldingen.</span>
+    <div class="page-head">
+      <div><h1>Incidenten</h1><p>Elk probleem opent automatisch een incident en sluit bij herstel. Bevestigen stopt de herinneringen.</p></div>
+      <div class="right">${segHtml('iFilter', [['open', 'Open'], ['30', '30 dagen'], ['90', '90 dagen']], st.filter)}</div>
     </div>
     <section class="panel" id="incPanel" style="margin-top:0"><p class="muted">Laden…</p></section>`;
   onSeg('iFilter', (v) => { st.filter = v; prefs.incFilter = v; savePrefs(); load(); });
@@ -450,6 +449,7 @@ async function renderAccount() {
   const u = (await api('/me')).user;
   if (nav !== view.nav) return;
   main.innerHTML = `
+    <div class="page-head"><div><h1>Account</h1><p>Je gegevens, wachtwoord en tweestapsverificatie.</p></div></div>
     <div class="cols" style="align-items:start">
       <section class="panel" style="margin-top:0">
         <h3>Mijn account</h3>
@@ -700,7 +700,7 @@ function drawNotifySettings(el, s) {
     }
     return out;
   };
-  const msg = (text, ok) => { $('#nMsg').style.color = ok ? '#86efac' : ''; $('#nMsg').textContent = text; };
+  const msg = (text, ok) => { $('#nMsg').style.color = ok ? 'var(--success-500)' : ''; $('#nMsg').textContent = text; };
   form.onchange = (e) => {
     if (e.target.name?.endsWith('.enabled')) e.target.closest('fieldset').classList.toggle('on', e.target.checked);
   };
@@ -741,7 +741,7 @@ function drawGeneralSettings(el, s) {
     const fd = new FormData(e.target);
     try {
       await api('/settings', { method: 'PUT', body: { autoSites: { enabled: fd.get('autoEnabled') === 'on', check: fd.get('autoCheck') === 'on' }, heartbeatUrl: fd.get('heartbeatUrl') } });
-      $('#gMsg').style.color = '#86efac';
+      $('#gMsg').style.color = 'var(--success-500)';
       $('#gMsg').textContent = 'Opgeslagen ✓';
     } catch (ex) { $('#gMsg').style.color = ''; $('#gMsg').textContent = ex.message; }
   };
