@@ -718,19 +718,33 @@ function playSound(kind) {
   }
 }
 
+/** Toestand van één server/website voor het geluid: niveau + niveau per probleem (issue-key). */
+function soundState(status) {
+  const issues = new Map();
+  for (const i of status.issues || []) {
+    if (i.level === 'crit' || (i.level === 'warn' && issues.get(i.key) !== 'crit')) issues.set(i.key, i.level);
+  }
+  return { level: status.level, issues };
+}
+
 /**
  * Welk geluid hoort bij de overgangen tussen twee metingen? Eén geluid per verversing, het zwaarste:
- * nieuw kritiek > nieuwe waarschuwing > hersteld. `prev` leeg = eerste meting, dan geen geluid.
+ * nieuw kritiek probleem > nieuwe waarschuwing > hersteld. Er wordt per probleem vergeleken, zodat ook
+ * een server die al kritiek was en er een nieuw kritiek probleem bij krijgt (bijv. uitval) geluid geeft.
+ * `prev` leeg = eerste meting, dan geen geluid.
  */
 function soundForChanges(prev, next) {
   if (!prev.size) return null;
   let crit = false, warn = false, ok = false;
-  for (const [key, lvl] of next) {
+  for (const [key, now] of next) {
     const was = prev.get(key);
-    if (was === undefined || lvl === was) continue;
-    if (lvl === 'crit') crit = true;
-    else if (lvl === 'warn' && was !== 'crit') warn = true;
-    else if (lvl === 'ok' && (was === 'crit' || was === 'warn')) ok = true;
+    if (!was || now.level === 'muted') continue;
+    for (const [ik, lvl] of now.issues) {
+      const before = was.issues.get(ik);
+      if (lvl === 'crit' && before !== 'crit') crit = true;
+      else if (lvl === 'warn' && !before) warn = true;
+    }
+    if (now.level === 'ok' && (was.level === 'crit' || was.level === 'warn')) ok = true;
   }
   return crit ? 'crit' : warn ? 'warn' : ok ? 'ok' : null;
 }
@@ -758,12 +772,14 @@ function renderTv() {
 
   // Geluid bij nieuwe problemen en herstel (staat standaard aan, per browser te wijzigen).
   const soundOn = () => prefs.tvSound !== false;
+  let lastSound = '';
   const drawSoundBtn = () => {
     const b = $('#tvSound');
     if (!b) return;
     const blocked = soundOn() && !soundReady();
     b.textContent = !soundOn() ? '🔕 Geluid uit' : blocked ? '🔇 Klik voor geluid' : '🔔 Geluid aan';
-    b.title = blocked ? 'De browser laat pas geluid toe na een klik op de pagina' : 'Geluid bij nieuwe problemen en bij herstel';
+    b.title = (blocked ? 'De browser laat pas geluid toe na een klik op de pagina' : 'Geluid bij nieuwe problemen en bij herstel')
+      + (lastSound ? `\nLaatste geluid: ${lastSound}` : '');
     b.classList.toggle('lvl-warn', blocked);
   };
   $('#tvSound').onclick = () => {
@@ -780,16 +796,21 @@ function renderTv() {
   document.addEventListener('click', unlock);
   view.cleanup.push(() => document.removeEventListener('click', unlock));
 
-  let levels = new Map();   // 's:<id>' / 'w:<id>' -> level bij de vorige verversing
+  let states = new Map();   // 's:<id>' / 'w:<id>' -> soundState bij de vorige verversing
 
   async function load() {
     try {
       const d = await api('/tv');
       if (nav !== view.nav) return;
-      const next = new Map([...d.servers.map((s) => [`s:${s.id}`, s.status.level]), ...d.websites.map((w) => [`w:${w.id}`, w.status.level])]);
-      const sound = soundForChanges(levels, next);
-      levels = next;
-      if (sound && soundOn()) playSound(sound);
+      const next = new Map([...d.servers.map((s) => [`s:${s.id}`, soundState(s.status)]), ...d.websites.map((w) => [`w:${w.id}`, soundState(w.status)])]);
+      const sound = soundForChanges(states, next);
+      states = next;
+      if (sound && soundOn()) {
+        playSound(sound);
+        lastSound = `${{ crit: 'Kritiek', warn: 'Waarschuwing', ok: 'Hersteld' }[sound]} om ${new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })}`;
+      }
+      // Laat zien als de browser het geluid (opnieuw) blokkeert, bijv. na slaapstand of wisselen van audioapparaat.
+      drawSoundBtn();
       draw(d);
     } catch { /* volgende poging */ }
   }
