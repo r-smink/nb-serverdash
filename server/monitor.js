@@ -192,6 +192,12 @@ export function forget(kind, id) {
 
 const EXTRA_KEYS = ['backups', 'updates', 'wordpress', 'domains', 'user_domains', 'dbs'];
 
+// Servers waarvan de agent bij de volgende meting de domeinen opnieuw moet scannen.
+const rescanRequested = new Set();
+export const requestRescan = (id) => rescanRequested.add(id);
+/** Geeft true (één keer) als er voor deze server een domeinscan is aangevraagd. */
+export const takeRescan = (id) => rescanRequested.delete(id);
+
 /** Verwerkt één meting van een agent. Geeft de lijst te meten websites terug. */
 export function ingest(s, body) {
   const now = nowSec();

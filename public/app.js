@@ -916,17 +916,25 @@ function siteTileHtml(w, d) {
     </a>`;
 }
 
+const OTHER_DOMAIN = '__other';
+
 function websiteForm(w, servers) {
   return new Promise((resolve) => {
+    const plesk = servers.filter((s) => s.type === 'plesk');
+    const serverId = w.server_id || (plesk.length === 1 ? plesk[0].id : null);
     const opts = [...servers].sort((a, b) => a.name.localeCompare(b.name, 'nl', { numeric: true }))
-      .map((s) => `<option value="${s.id}" ${s.id === w.server_id ? 'selected' : ''}>${esc(s.name)}${s.type !== 'plesk' ? ` (${TYPES[s.type] || s.type})` : ''}</option>`).join('');
+      .map((s) => `<option value="${s.id}" ${s.id === serverId ? 'selected' : ''}>${esc(s.name)}${s.type !== 'plesk' ? ` (${TYPES[s.type] || s.type})` : ''}</option>`).join('');
     const d = dialog(`
       <form class="form" method="dialog">
         <h3>${w.id ? 'Website bewerken' : 'Website toevoegen'}</h3>
         <div class="row">
-          <label>Domein (zoals in Plesk)<input name="domain" required value="${esc(w.domain)}" placeholder="voorbeeld.nl"></label>
           <label>Draait op server<select name="server_id" required><option value="">Kies…</option>${opts}</select></label>
+          <label>Domein (zoals in Plesk)
+            <select name="domain_pick" class="hidden"></select>
+            <input name="domain" value="${esc(w.domain)}" placeholder="voorbeeld.nl">
+          </label>
         </div>
+        <p class="note" id="domainNote"></p>
         <label>Controle-URL<input name="url" value="${esc(w.url)}" placeholder="Standaard: https://&lt;domein&gt;/"></label>
         <div class="row">
           <label>Sleutelwoord op de pagina (optioneel)<input name="keyword" value="${esc(w.keyword)}" placeholder="bijv. ©, Winkelwagen"></label>
@@ -943,10 +951,89 @@ function websiteForm(w, servers) {
         </div>
       </form>`);
     const form = $('form', d);
+    const serverSel = form.server_id, pick = form.domain_pick, input = form.domain, note = $('#domainNote', d);
+    let found = new Map();   // serverId -> { checked, domains: [{domain, monitored}] }
+    let scanning = null;     // serverId waarvoor een scan loopt
+
+    const loadDiscover = async () => {
+      const r = await api('/websites/discover');
+      found = new Map(r.servers.map((s) => [s.id, s]));
+    };
+    const showInput = (on) => {
+      input.classList.toggle('hidden', !on);
+      input.required = on;
+    };
+    const scanBtn = (s) => s.type === 'plesk' ? ` <button type="button" class="btn ghost small" id="scanDomains">↻ Nu scannen</button>` : '';
+
+    const render = (keep) => {
+      const sid = +serverSel.value;
+      const s = servers.find((x) => x.id === sid);
+      const info = found.get(sid);
+      const doms = info?.domains || [];
+      const prev = keep ? pick.value : null;
+      if (!s || !doms.length) {
+        pick.classList.add('hidden');
+        pick.required = false;
+        showInput(true);
+        note.innerHTML = !s ? ''
+          : scanning === sid ? 'Scan aangevraagd — wachten op de agent…'
+          : s.type !== 'plesk' ? ''
+          : (info?.checked ? 'Geen domeinen gevonden op deze server.' : 'Nog geen domeinscan ontvangen van de agent op deze server.') + scanBtn(s);
+      } else {
+        // nog niet bewaakte domeinen eerst; al bewaakte domeinen tonen we, maar uitgeschakeld (behalve het huidige)
+        const sorted = [...doms].sort((a, b) => (a.monitored && a.domain !== w.domain) - (b.monitored && b.domain !== w.domain) || a.domain.localeCompare(b.domain));
+        pick.innerHTML = `<option value="">Kies een domein…</option>`
+          + sorted.map((x) => {
+            const taken = x.monitored && x.domain !== w.domain;
+            return `<option value="${esc(x.domain)}" ${taken ? 'disabled' : ''}>${esc(x.domain)}${taken ? ' (al bewaakt)' : ''}</option>`;
+          }).join('')
+          + `<option value="${OTHER_DOMAIN}">Ander domein invoeren…</option>`;
+        const want = (prev !== OTHER_DOMAIN && prev) || input.value;
+        pick.value = want && doms.some((x) => x.domain === want) ? want : want ? OTHER_DOMAIN : '';
+        pick.classList.remove('hidden');
+        pick.required = true;
+        showInput(pick.value === OTHER_DOMAIN);
+        const free = doms.filter((x) => !x.monitored).length;
+        note.innerHTML = scanning === sid ? 'Scan aangevraagd — wachten op de agent…'
+          : `${doms.length} domeinen gevonden, ${free} nog niet bewaakt · gescand ${fmt.ago(info.checked)}${scanBtn(s)}`;
+      }
+    };
+
+    serverSel.addEventListener('change', () => render(false));
+    pick.addEventListener('change', () => {
+      showInput(pick.value === OTHER_DOMAIN);
+      if (pick.value === OTHER_DOMAIN) input.focus();
+    });
+    note.addEventListener('click', async (e) => {
+      if (e.target.id !== 'scanDomains') return;
+      const sid = +serverSel.value;
+      try {
+        const { since } = await api(`/servers/${sid}/scan-domains`, { method: 'POST' });
+        scanning = sid;
+        render(true);
+        // De agent pakt het verzoek op bij zijn volgende meting; poll tot er een verse scan binnen is (max ~2 min).
+        for (let i = 0; i < 24 && d.isConnected; i++) {
+          await new Promise((r) => setTimeout(r, 5000));
+          await loadDiscover();
+          if ((found.get(sid)?.checked || 0) >= since) break;
+        }
+        if ((found.get(sid)?.checked || 0) < since) $('.form-error', d).textContent = 'De agent heeft (nog) niet gereageerd. Controleer of de agent draait en versie 1.3 of nieuwer is.';
+      } catch (ex) {
+        $('.form-error', d).textContent = ex.message;
+      }
+      scanning = null;
+      if (d.isConnected) render(true);
+    });
+    loadDiscover().then(() => render(false), () => render(false));
+    render(false);
+
     form.addEventListener('submit', async (e) => {
       if (e.submitter?.value === 'cancel') return resolve(null);
       e.preventDefault();
       const data = Object.fromEntries(new FormData(form));
+      if (data.domain_pick && data.domain_pick !== OTHER_DOMAIN) data.domain = data.domain_pick;
+      delete data.domain_pick;
+      if (!data.domain) return ($('.form-error', d).textContent = 'Kies of vul een domein in');
       data.check_enabled = !!data.check_enabled;
       data.server_id = +data.server_id;
       try {

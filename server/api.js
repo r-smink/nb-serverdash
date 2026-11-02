@@ -175,7 +175,8 @@ on('POST', '/api/ingest', ({ req, body }) => {
   const s = token && store.serverByToken(token);
   if (!s) throw new HttpError(401, 'Ongeldig token');
   if (!body || typeof body !== 'object' || !body.cpu) throw new HttpError(400, 'Ongeldige payload');
-  return { ok: true, sites: mon.ingest(s, body) };
+  const sites = mon.ingest(s, body);
+  return mon.takeRescan(s.id) ? { ok: true, sites, rescan: ['domains'] } : { ok: true, sites };
 }, { auth: false });
 
 // ---------- overzicht & servers ----------
@@ -381,6 +382,13 @@ on('GET', '/api/websites/discover', () => {
       };
     }).filter((s) => s.domains.length || s.type === 'plesk'),
   };
+});
+
+/** Laat de agent van een server de Plesk-domeinen bij de volgende meting opnieuw scannen. */
+on('POST', '/api/servers/:id/scan-domains', ({ params }) => {
+  const s = requireServer(params.id);
+  mon.requestRescan(s.id);
+  return { ok: true, since: nowSec() };
 });
 
 on('POST', '/api/websites/bulk', ({ body }) => {

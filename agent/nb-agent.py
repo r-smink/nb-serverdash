@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 CONF_FILE = os.environ.get('NB_AGENT_CONF', '/etc/nb-agent.conf')
 HZ = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
@@ -383,7 +383,8 @@ class Collector(object):
             if len(f) < 4 or not f[0].endswith('.service'):
                 continue
             states[f[0][:-8]] = f[2]
-            if f[2] == 'failed':
+            # LOAD=not-found: het unit-bestand bestaat niet meer, systemd onthoudt alleen nog de oude status.
+            if f[2] == 'failed' and f[1] != 'not-found':
                 failed.append(f[0])
 
         watched = {}
@@ -793,11 +794,13 @@ class SlowTasks(object):
         self.versions = {}     # naam -> versienummer van het resultaat
         self.sent = {}         # naam -> (versie, tijd) laatst succesvol verstuurd
         self.next_run = {}
+        self.forced = set()    # door het dashboard aangevraagde controles: resultaat altijd opnieuw versturen
         self.thread = None
 
     def tasks(self):
-        t = [('f2b', 300, self.task_f2b), ('backups', 600, self.task_backups), ('updates', 3600, self.task_updates),
-             ('domains', 3600, self.task_domains), ('dbs', 21600, self.task_dbs)]
+        # domeinen eerst: direct na het koppelen staat de websitelijst dan zo snel mogelijk in het dashboard
+        t = [('domains', 3600, self.task_domains), ('f2b', 300, self.task_f2b), ('backups', 600, self.task_backups),
+             ('updates', 3600, self.task_updates), ('dbs', 21600, self.task_dbs)]
         if self.c.conf.get('wordpress', '1') not in ('0', 'false', 'no'):
             t.append(('wordpress', 21600, self.task_wordpress))
         return t
@@ -816,6 +819,12 @@ class SlowTasks(object):
         for name, _, fn in self.tasks():
             self.run_task(name, fn)
 
+    def request(self, name):
+        """Voert een controle zo snel mogelijk uit en verstuurt het resultaat, ook als het niet veranderd is."""
+        with self.lock:
+            self.forced.add(name)
+        self.next_run[name] = 0
+
     def run_task(self, name, fn):
         try:
             res = fn()
@@ -827,6 +836,10 @@ class SlowTasks(object):
                 self.set(name, res)
         except Exception as e:
             log('controle %s mislukt: %s' % (name, e))
+        with self.lock:
+            if name in self.forced:
+                self.forced.discard(name)
+                self.sent.pop(name, None)
 
     def start(self):
         def loop():
@@ -1140,6 +1153,9 @@ def main():
                 queue.pop(0)
                 if isinstance(resp.get('sites'), list):
                     collector.sites = [str(d).lower() for d in resp['sites']][:200]
+                if isinstance(resp.get('rescan'), list):
+                    for name in resp['rescan']:   # dashboard vraagt om een controle nu i.p.v. bij het volgende interval
+                        collector.slow.request(str(name))
             except urllib.error.HTTPError as e:
                 log('dashboard antwoordde HTTP %s: %s' % (e.code, e.read()[:200]))
                 if e.code in (400, 401, 403, 413):
