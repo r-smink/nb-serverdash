@@ -4,7 +4,7 @@ import { config } from './config.js';
 import * as store from './db.js';
 import * as auth from './auth.js';
 import * as mon from './monitor.js';
-import { DEFAULT_THRESHOLDS, mergeThresholds } from './status.js';
+import { DEFAULT_THRESHOLDS, mergeThresholds, cleanOverrides } from './status.js';
 import { maskedNotifyConfig, saveNotifyConfig, notify } from './alerts.js';
 import { diskForecast, wordpressOverview, refreshWporg, cmpVersion } from './insights.js';
 
@@ -234,6 +234,7 @@ function validateServer(body, current = {}) {
         enabled: cfgIn.backup?.enabled !== false,
         maxAgeHours: Math.max(0, Math.min(24 * 31, Math.floor(+cfgIn.backup?.maxAgeHours || 0))),
       },
+      thresholds: cleanOverrides(cfgIn.thresholds),
     },
   };
 }
@@ -255,7 +256,7 @@ on('GET', '/api/servers/:id', ({ params }) => {
     return { ...f, total: d?.total ?? null, bytesPerDay: d && f.perDay != null ? (f.perDay / 100) * d.total : null };
   });
   return {
-    ...mon.serverSummary(s, th, now), thresholds: th, payload: p, events: store.serverEvents(s.id, 50), websites,
+    ...mon.serverSummary(s, th, now), defaultThresholds: th, payload: p, events: store.serverEvents(s.id, 50), websites,
     forecast, reach: mon.reachOf(s), reachTarget: mon.reachTarget(s),
     backups: extra.backups || null, updates: extra.updates || null, dbs: extra.dbs || null, dbs_ts: extra.dbs_ts || null,
     wordpress: (extra.wordpress?.sites || []).length,
@@ -415,7 +416,6 @@ on('GET', '/api/websites/:id', ({ params }) => {
   const sp = server && mon.payloadOf(server);
   return {
     ...summary,
-    thresholds: th,
     fullStats: mon.parse(w.last_stats),
     uptime7d: store.uptimeSince(w.id, now - 7 * 86400),
     uptime30d: store.uptimeSince(w.id, now - 30 * 86400),
@@ -494,6 +494,7 @@ on('GET', '/api/maintenance', () => {
     const forecast = s.last_seen ? diskForecast(s.id, now) : [];
     return {
       id: s.id, name: s.name, type: s.type, level: mon.statusOf(s, th, now).level, last_seen: s.last_seen,
+      thresholds: mon.thresholdsFor(s, th),
       backupCfg: mon.configOf(s).backup || { enabled: true },
       backups: extra.backups || null,
       updates: extra.updates || null,

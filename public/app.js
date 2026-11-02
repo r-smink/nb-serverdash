@@ -269,7 +269,7 @@ function sparkSvg(vals, max = 100) {
 }
 
 function tileHtml(s, d) {
-  const th = d.thresholds, m = s.summary, lvl = s.status.level;
+  const th = s.thresholds || d.thresholds, m = s.summary, lvl = s.status.level;
   const big = d.enlarge && lvl === 'crit';
   const issues = s.status.issues.filter((i) => i.level !== 'info' && i.level !== 'pending');
   let body;
@@ -690,6 +690,7 @@ function renderDetail(id) {
       ['Agent', d.agent], ['Laatst gezien', d.last_seen && `${fmt.time(d.last_seen)} (${fmt.ago(d.last_seen)})`],
       ['TCP-check', d.reach ? `${d.reach.ok ? `OK, poort ${d.reach.port} in ${d.reach.ms} ms` : `MISLUKT (${d.reach.error || 'geen verbinding'}) op ${d.reach.ports.join(', ')}`} · ${d.reach.host} · ${fmt.ago(d.reach.ts)}`
         : d.reachTarget ? 'wacht op eerste controle' : 'uit (geen hostname)'],
+      ['Afwijkende drempels', overridesText(d.config?.thresholds)],
       ['Notities', d.notes],
     ].filter(([, v]) => v);
     $('#infoPanel').innerHTML = `
@@ -889,7 +890,7 @@ const errPct = (s) => {
 };
 
 function siteTileHtml(w, d) {
-  const th = d.thresholds, s = w.stats, c = w.check, lvl = w.status.level;
+  const th = w.thresholds || d.thresholds, s = w.stats, c = w.check, lvl = w.status.level;
   const big = d.enlarge && lvl === 'crit';
   const issues = w.status.issues.filter((i) => i.level === 'crit' || i.level === 'warn');
   const stat = (label, value, cls = '') => `<div><span>${label}</span><b class="${cls}">${value}</b></div>`;
@@ -1251,6 +1252,26 @@ function dialog(html) {
   return d;
 }
 
+// Drempelwaarden: [sleutel, label, eenheid/uitleg] — gedeeld door Beheer en het serverformulier.
+const TH_ROWS = [
+  ['cpu', 'CPU-gebruik', '%, gemiddeld'], ['load', 'Load per core', 'load1 / cores, gemiddeld'],
+  ['iowait', 'IO-wait', '%, gemiddeld'], ['mem', 'Geheugen', '% in gebruik'], ['swap', 'Swap', '%'],
+  ['disk', 'Schijfruimte', '% per mount'], ['inodes', 'Inodes', '% per mount'], ['mailq', 'Mailwachtrij', 'aantal berichten'],
+  ['response', 'Website: responstijd', 'ms'], ['ssl', 'Website: SSL verloopt binnen', 'dagen (lager = slechter)'],
+  ['err5xx', 'Website: serverfouten', '% 5xx-responses'], ['siteCpu', 'Website: CPU', '% van één core, gemiddeld'],
+  ['backupAge', 'Back-up ouder dan', 'uren'], ['diskDays', 'Schijf vol binnen', 'dagen bij huidige groei (lager = slechter)'],
+  ['dbConn', 'Database-verbindingen', '% van max_connections'], ['replLag', 'Replicatie-achterstand', 'seconden'],
+  ['longQuery', 'Langlopende query', 'seconden'], ['secUpdates', 'Security-updates', 'aantal (0 = alleen tonen, geen melding)'],
+];
+
+/** Korte tekst van de afwijkende drempels van een server, bijv. "CPU 95/99 · Schijfruimte 90/97". */
+function overridesText(o) {
+  if (!o) return '';
+  const parts = TH_ROWS.filter(([k]) => o[k]).map(([k, l]) => `${l} ${o[k].warn ?? '–'}/${o[k].crit ?? '–'}`);
+  if (o.offlineSeconds) parts.push(`offline na ${o.offlineSeconds} s`);
+  return parts.join(' · ');
+}
+
 function serverForm(s = {}) {
   return new Promise((resolve) => {
     const d = dialog(`
@@ -1275,6 +1296,21 @@ function serverForm(s = {}) {
             </div>
           </div>
         </details>
+        <details ${overridesText(s.config?.thresholds) ? 'open' : ''}><summary>Afwijkende drempelwaarden${overridesText(s.config?.thresholds) ? ' <span class="muted">(ingesteld)</span>' : ''}</summary>
+          <div class="form" style="margin-top:10px">
+            <p class="note">Laat een veld leeg om de algemene drempel (grijs) te gebruiken. De website-drempels gelden voor alle websites op deze server.</p>
+            <div class="table-wrap" style="max-height:320px"><table class="th-table" style="width:auto">
+              <thead><tr><th>Meting</th><th>Waarschuwing</th><th>Kritiek</th></tr></thead>
+              <tbody>${TH_ROWS.map(([k, l, hint]) => `<tr title="${esc(hint)}">
+                <td>${l}</td>
+                ${['warn', 'crit'].map((lvl) => `<td><input type="number" step="any" name="th.${k}.${lvl}" value="${s.config?.thresholds?.[k]?.[lvl] ?? ''}"></td>`).join('')}
+              </tr>`).join('')}
+              <tr><td>Offline na (seconden zonder data)</td><td colspan="2"><input type="number" min="60" name="th.offlineSeconds" value="${s.config?.thresholds?.offlineSeconds ?? ''}"></td></tr>
+              </tbody>
+            </table></div>
+            <div><button type="button" class="btn ghost small" id="thClear">Alles terug naar algemeen</button></div>
+          </div>
+        </details>
         ${s.id ? `<label class="check"><input type="checkbox" name="muted" ${s.muted ? 'checked' : ''}> Gepauzeerd (onderhoud — geen meldingen, grijs in overzicht)</label>` : ''}
         <div class="form-error"></div>
         <div class="actions">
@@ -1283,14 +1319,38 @@ function serverForm(s = {}) {
         </div>
       </form>`);
     const form = $('form', d);
+    const thInputs = $$('input[name^="th."]', form);
+    const markOverrides = () => thInputs.forEach((i) => i.classList.toggle('overridden', i.value !== ''));
+    form.addEventListener('input', (e) => { if (e.target.name?.startsWith('th.')) markOverrides(); });
+    $('#thClear', d).onclick = () => { thInputs.forEach((i) => { i.value = ''; }); markOverrides(); };
+    markOverrides();
+    // algemene drempels als placeholder tonen
+    api('/settings').then((g) => {
+      for (const i of thInputs) {
+        const [, k, lvl] = i.name.split('.');
+        const v = lvl ? g.thresholds[k]?.[lvl] : g.thresholds[k];
+        if (v != null) i.placeholder = v;
+      }
+    }).catch(() => {});
+
     form.addEventListener('submit', async (e) => {
       if (e.submitter?.value === 'cancel') return resolve(null);
       e.preventDefault();
       const data = Object.fromEntries(new FormData(form));
+      const thresholds = {};
+      for (const [name, v] of Object.entries(data)) {
+        if (!name.startsWith('th.')) continue;
+        delete data[name];
+        if (v === '') continue;
+        const [, k, lvl] = name.split('.');
+        if (lvl) (thresholds[k] ||= {})[lvl] = +v;
+        else thresholds[k] = +v;
+      }
       data.muted = !!data.muted;
       data.config = {
         ports: data.ports, reachHost: data.reachHost, reach: !!data.reach,
         backup: { enabled: !!data.backupEnabled, maxAgeHours: +data.backupMaxAge || 0 },
+        thresholds,
       };
       try {
         const res = s.id
@@ -1404,16 +1464,7 @@ async function renderAdmin() {
   async function loadSettings() {
     const s = await api('/settings');
     if (nav !== view.nav) return;
-    const rows = [
-      ['cpu', 'CPU-gebruik', '%, gemiddeld'], ['load', 'Load per core', 'load1 / cores, gemiddeld'],
-      ['iowait', 'IO-wait', '%, gemiddeld'], ['mem', 'Geheugen', '% in gebruik'], ['swap', 'Swap', '%'],
-      ['disk', 'Schijfruimte', '% per mount'], ['inodes', 'Inodes', '% per mount'], ['mailq', 'Mailwachtrij', 'aantal berichten'],
-      ['response', 'Website: responstijd', 'ms'], ['ssl', 'Website: SSL verloopt binnen', 'dagen (lager = slechter)'],
-      ['err5xx', 'Website: serverfouten', '% 5xx-responses'], ['siteCpu', 'Website: CPU', '% van één core, gemiddeld'],
-      ['backupAge', 'Back-up ouder dan', 'uren'], ['diskDays', 'Schijf vol binnen', 'dagen bij huidige groei (lager = slechter)'],
-      ['dbConn', 'Database-verbindingen', '% van max_connections'], ['replLag', 'Replicatie-achterstand', 'seconden'],
-      ['longQuery', 'Langlopende query', 'seconden'], ['secUpdates', 'Security-updates', 'aantal (0 = alleen tonen, geen melding)'],
-    ];
+    const rows = TH_ROWS;
     const t = s.thresholds;
     $('#thForm').innerHTML = `
       <table class="th-table" style="width:auto">

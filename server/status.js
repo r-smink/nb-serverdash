@@ -36,6 +36,39 @@ export function mergeThresholds(saved) {
   return out;
 }
 
+/**
+ * Alleen de geldige afwijkende waarden van een server (voor opslag in servers.config.thresholds).
+ * Lege of ongeldige waarden vallen weg; zo blijft de globale drempel gelden.
+ */
+export function cleanOverrides(input) {
+  const out = {};
+  for (const [k, v] of Object.entries(input || {})) {
+    if (!(k in DEFAULT_THRESHOLDS) || k === 'sustainMinutes') continue;
+    if (typeof DEFAULT_THRESHOLDS[k] === 'object') {
+      const pair = {};
+      for (const lvl of ['warn', 'crit']) {
+        if (v?.[lvl] !== '' && v?.[lvl] != null && Number.isFinite(+v[lvl])) pair[lvl] = +v[lvl];
+      }
+      if (Object.keys(pair).length) out[k] = pair;
+    } else if (v !== '' && v != null && Number.isFinite(+v) && +v > 0) {
+      out[k] = +v;
+    }
+  }
+  return out;
+}
+
+/** Globale drempels met de afwijkende waarden van één server eroverheen. */
+export function effectiveThresholds(th, overrides) {
+  const o = cleanOverrides(overrides);
+  if (!Object.keys(o).length) return th;
+  const out = structuredClone(th);
+  for (const [k, v] of Object.entries(o)) {
+    if (typeof v === 'object') Object.assign(out[k], v);
+    else out[k] = v;
+  }
+  return out;
+}
+
 const RANK = { crit: 3, warn: 2, pending: 1, info: 0 };
 const OK_STATES = new Set(['active', 'activating', 'reloading']);
 

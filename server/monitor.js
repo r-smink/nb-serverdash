@@ -3,7 +3,7 @@ import net from 'node:net';
 import zlib from 'node:zlib';
 import { config } from './config.js';
 import * as store from './db.js';
-import { evaluate, evaluateSite, mergeThresholds } from './status.js';
+import { evaluate, evaluateSite, mergeThresholds, effectiveThresholds } from './status.js';
 import { checkUrl } from './checker.js';
 import { handleTransition, remind } from './alerts.js';
 import { diskForecast } from './insights.js';
@@ -56,8 +56,11 @@ export const reachOf = (s) => parse(s.reach);
 
 // ---------- status servers ----------
 
+/** Drempels voor één server: globaal, met de afwijkende waarden van die server eroverheen. */
+export const thresholdsFor = (s, th = thresholds()) => (s ? effectiveThresholds(th, configOf(s).thresholds) : th);
+
 export function statusOf(s, th = thresholds(), now = nowSec()) {
-  return evaluate(s, payloadOf(s), getRecent(s.id), th, now, {
+  return evaluate(s, payloadOf(s), getRecent(s.id), thresholdsFor(s, th), now, {
     extra: extraOf(s), config: configOf(s), reach: reachOf(s),
     forecast: s.last_seen ? diskForecast(s.id, now) : [],
   });
@@ -91,14 +94,14 @@ export function serverSummary(s, th, now) {
   return {
     id: s.id, name: s.name, hostname: s.hostname, type: s.type, notes: s.notes, muted: !!s.muted,
     config: configOf(s), created_at: s.created_at, last_seen: s.last_seen, agent: p?.agent || null,
-    status, summary, spark: sparkline(getRecent(s.id), now, 'cpu'),
+    thresholds: thresholdsFor(s, th), status, summary, spark: sparkline(getRecent(s.id), now, 'cpu'),
   };
 }
 
 // ---------- status websites ----------
 
 export function siteStatus(w, server, th = thresholds(), now = nowSec()) {
-  return evaluateSite(w, server, parse(w.last_stats), parse(w.last_check), getSiteRecent(w.id), th, now);
+  return evaluateSite(w, server, parse(w.last_stats), parse(w.last_check), getSiteRecent(w.id), thresholdsFor(server, th), now);
 }
 
 export function siteSummary(w, serversById, th, now) {
@@ -108,6 +111,7 @@ export function siteSummary(w, serversById, th, now) {
     id: w.id, domain: w.domain, url: w.url, keyword: w.keyword, check_enabled: !!w.check_enabled, notes: w.notes,
     server: server ? { id: server.id, name: server.name, hostname: server.hostname } : null,
     server_id: w.server_id,
+    thresholds: thresholdsFor(server, th),
     status: siteStatus(w, server, th, now),
     stats: stats && {
       found: stats.found, user: stats.user, cpu: stats.cpu, rss: stats.rss, rio: stats.rio, wio: stats.wio, procs: stats.procs,

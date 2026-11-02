@@ -158,9 +158,10 @@ function renderMaintenance() {
       const b = s.backups;
       if (!b) return 'pending';
       if (!b.last) return 'warn';
-      const lim = (s.backupCfg?.maxAgeHours || th.backupAge.warn) * 3600;
+      const sth = s.thresholds || th;
+      const lim = (s.backupCfg?.maxAgeHours || sth.backupAge.warn) * 3600;
       const age = now - b.last.ts;
-      if (b.last.status === 'error' || age > (s.backupCfg?.maxAgeHours ? lim * 2 : th.backupAge.crit * 3600)) return 'crit';
+      if (b.last.status === 'error' || age > (s.backupCfg?.maxAgeHours ? lim * 2 : sth.backupAge.crit * 3600)) return 'crit';
       if (age > lim || b.last.status === 'warnings') return 'warn';
       return 'ok';
     };
@@ -739,9 +740,9 @@ function renderTv() {
       return `<a class="tv-mini-tile lvl-${s.status.level}" href="#/server/${s.id}">
         <div class="tv-mini-name"><span class="dot"></span>${esc(s.name)}</div>
         ${m && !s.status.offline ? `<div class="tv-bars">
-          <span title="CPU"><i style="width:${Math.min(100, m.cpu || 0)}%" class="${lvlFor(m.cpu, d.thresholds.cpu)}"></i></span>
-          <span title="RAM"><i style="width:${Math.min(100, m.mem_pct || 0)}%" class="${lvlFor(m.mem_pct, d.thresholds.mem)}"></i></span>
-          <span title="Disk"><i style="width:${Math.min(100, m.disk?.pct || 0)}%" class="${lvlFor(m.disk?.pct, d.thresholds.disk)}"></i></span>
+          <span title="CPU"><i style="width:${Math.min(100, m.cpu || 0)}%" class="${lvlFor(m.cpu, (s.thresholds || d.thresholds).cpu)}"></i></span>
+          <span title="RAM"><i style="width:${Math.min(100, m.mem_pct || 0)}%" class="${lvlFor(m.mem_pct, (s.thresholds || d.thresholds).mem)}"></i></span>
+          <span title="Disk"><i style="width:${Math.min(100, m.disk?.pct || 0)}%" class="${lvlFor(m.disk?.pct, (s.thresholds || d.thresholds).disk)}"></i></span>
         </div><div class="tv-mini-val">${fmt.pct(m.cpu)} CPU</div>` : `<div class="tv-mini-val">${s.status.offline ? 'offline' : '–'}</div>`}
       </a>`;
     }).join('');

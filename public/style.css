@@ -489,6 +489,7 @@ dialog::backdrop { background: rgba(22, 22, 22, .45); backdrop-filter: blur(3px)
 .th-table td { padding: 4px 12px 4px 0; border: 0; }
 .th-table tr:hover td { background: none; }
 .th-table input { width: 90px; padding: 6px 9px; font-variant-numeric: tabular-nums; }
+.th-table input.overridden { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn); }
 
 /* ---------- login ---------- */
 .login-page {
