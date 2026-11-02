@@ -817,6 +817,245 @@ const CHANNEL_DEFS = [
   ['twilio', 'SMS (Twilio)', 'SMS naar één of meer nummers', [['sid', 'Account SID', 'AC…'], ['token', 'Auth token', '', 'password'], ['from', 'Afzendernummer', '+31…'], ['to', 'Ontvangers (komma-gescheiden)', '+316…']]],
 ];
 
+// ---------- meldingsregels ----------
+
+const CH_LABEL = { webhook: 'Webhook', email: 'E-mail', pushover: 'Pushover', ntfy: 'ntfy', twilio: 'SMS' };
+// Ontvangers die een regel per kanaal mag vervangen: [kanaal, label, placeholder]
+const RULE_TO = [
+  ['email', 'E-mailadressen', 'klant@voorbeeld.nl, collega@nextbuzz.nl'], ['twilio', 'Sms-nummers', '+316…'],
+  ['webhook', 'Webhook-URL', 'https://hooks.slack.com/services/…'], ['ntfy', 'ntfy-topic-URL', 'https://ntfy.sh/…'],
+];
+const DAYS = [[1, 'ma'], [2, 'di'], [3, 'wo'], [4, 'do'], [5, 'vr'], [6, 'za'], [7, 'zo']];
+
+/** Is een kanaal volledig ingesteld? (zelfde regels als READY op de server; wachtwoorden komen gemaskeerd binnen) */
+const channelReady = (n, ch) => ({
+  webhook: (c) => c.url, email: (c) => c.host && c.to, pushover: (c) => c.token && c.user,
+  ntfy: (c) => c.url && c.url.replace(/\/+$/, '') !== 'https://ntfy.sh', twilio: (c) => c.sid && c.token && c.from && c.to,
+})[ch](n[ch]);
+
+function ruleScopeText(r, opts) {
+  const kind = r.kind === 'server' ? ' (alleen servermeldingen)' : r.kind === 'site' ? ' (alleen websites)' : '';
+  if (r.scope === 'servers') {
+    const names = r.servers.map((id) => opts.servers.find((s) => s.id === id)?.name || `#${id}`);
+    return `${names.length > 3 ? `${names.slice(0, 3).join(', ')} +${names.length - 3}` : names.join(', ') || 'geen servers'}${kind}`;
+  }
+  if (r.scope === 'websites') {
+    const names = r.websites.map((id) => opts.websites.find((w) => w.id === id)?.domain || `#${id}`);
+    return names.length > 3 ? `${names.slice(0, 3).join(', ')} +${names.length - 3}` : names.join(', ') || 'geen websites';
+  }
+  return `Alles${kind}`;
+}
+
+function ruleWhenText(r) {
+  if (r.when === 'always') return 'Altijd';
+  const days = DAYS.filter(([d]) => r.days.includes(d)).map(([, l]) => l).join(' ');
+  return `${r.when === 'work' ? 'Binnen' : 'Buiten'} ${days} ${r.from}–${r.until}`;
+}
+
+function drawRulesSettings(el, s) {
+  let rules = s.rules || [];
+  const opts = s.ruleOptions;
+  const save = async () => {
+    await api('/settings', { method: 'PUT', body: { rules } });
+    rules = (await api('/settings')).rules;
+  };
+  const draw = (msg = '') => {
+    el.innerHTML = `
+      <div class="panel-head"><h3>Meldingsregels</h3>
+        <div class="right"><button class="btn small" id="ruleAdd">+ Regel</button></div></div>
+      <p class="note">De kanalen hierboven zijn de <b>standaard</b> voor alle servers en websites. Met regels stuur je meldingen van
+        bepaalde servers of websites (ook) naar andere kanalen of ontvangers, alleen op bepaalde tijden, of met escalatie als
+        niemand het incident bevestigt. Herstelmeldingen gaan naar dezelfde ontvangers als het probleem.</p>
+      <div class="table-wrap" style="max-height:none"><table>
+        <thead><tr><th>Actief</th><th>Naam</th><th>Geldt voor</th><th>Niveau</th><th>Wanneer</th><th>Kanalen</th><th>Escalatie</th><th></th></tr></thead>
+        <tbody>${rules.map((r, i) => `<tr data-i="${i}" class="${r.enabled ? '' : 'muted'}">
+          <td><label class="check"><input type="checkbox" data-toggle ${r.enabled ? 'checked' : ''}></label></td>
+          <td><b>${esc(r.name)}</b>${r.exclusive ? ' <span class="badge" title="Standaardkanalen worden voor deze servers/websites overgeslagen">i.p.v. standaard</span>' : ''}</td>
+          <td>${esc(ruleScopeText(r, opts))}</td>
+          <td>${r.minLevel === 'crit' ? 'Alleen kritiek' : 'Waarsch. + kritiek'}</td>
+          <td>${esc(ruleWhenText(r))}</td>
+          <td>${r.channels.map((c) => CH_LABEL[c]).join(', ') || '<span class="muted">geen (stil)</span>'}</td>
+          <td>${r.escalate.minutes && r.escalate.channels.length ? `na ${r.escalate.minutes} min → ${r.escalate.channels.map((c) => CH_LABEL[c]).join(', ')}` : '<span class="muted">–</span>'}</td>
+          <td style="white-space:nowrap"><button class="btn ghost small" data-edit>Bewerken</button> <button class="btn ghost small" data-del>Verwijderen</button></td>
+        </tr>`).join('') || '<tr><td colspan="8" class="muted">Nog geen regels — alle meldingen gaan naar de standaardkanalen.</td></tr>'}</tbody>
+      </table></div>
+      <div class="form-error" id="ruleMsg">${esc(msg)}</div>`;
+    $('#ruleAdd', el).onclick = () => edit(null);
+  };
+  const edit = async (i) => {
+    const r = await ruleDialog(i == null ? null : rules[i], s.notify, opts);
+    if (!r) return;
+    const before = rules;
+    rules = i == null ? [...rules, r] : rules.map((x, j) => (j === i ? r : x));
+    try { await save(); draw(); } catch (ex) { rules = before; draw(ex.message); }
+  };
+  el.onclick = async (e) => {
+    const tr = e.target.closest('tr[data-i]');
+    if (!tr) return;
+    const i = +tr.dataset.i;
+    if (e.target.closest('[data-edit]')) return edit(i);
+    if (e.target.closest('[data-del]')) {
+      if (!confirm(`Regel "${rules[i].name}" verwijderen?`)) return;
+      rules = rules.filter((_, j) => j !== i);
+    } else if (e.target.matches('[data-toggle]')) {
+      rules = rules.map((x, j) => (j === i ? { ...x, enabled: e.target.checked } : x));
+    } else return;
+    try { await save(); draw(); } catch (ex) { draw(ex.message); }
+  };
+  draw();
+}
+
+function ruleDialog(r, notify, opts) {
+  r = r || {
+    name: '', enabled: true, scope: 'servers', servers: [], websites: [], kind: '', minLevel: 'warn',
+    when: 'always', days: [1, 2, 3, 4, 5], from: '08:00', until: '18:00', channels: [], to: {}, exclusive: false,
+    escalate: { minutes: 0, channels: [], to: {} },
+  };
+  const chBoxes = (name, selected) => Object.keys(CH_LABEL).map((ch) => {
+    const ready = channelReady(notify, ch);
+    return `<label class="check" title="${ready ? '' : 'Vul dit kanaal eerst in bij de kanalen hierboven'}">
+      <input type="checkbox" name="${name}" value="${ch}" ${selected.includes(ch) ? 'checked' : ''} ${ready ? '' : 'disabled'}>
+      ${CH_LABEL[ch]}${ready ? '' : ' <span class="muted">(niet ingesteld)</span>'}</label>`;
+  }).join('');
+  const toFields = (prefix, to) => RULE_TO.map(([ch, label, ph]) => `
+    <label data-to="${prefix}.${ch}">${label} <span class="muted">(leeg = ontvangers van het kanaal)</span>
+      <input name="${prefix}.${ch}" value="${esc(to?.[ch] || '')}" placeholder="${esc(ph)}" autocomplete="off"></label>`).join('');
+  const byServer = [...opts.servers].sort(byName).map((s) => ({ ...s, sites: opts.websites.filter((w) => w.server_id === s.id).sort((a, b) => a.domain.localeCompare(b.domain)) }));
+
+  return new Promise((resolve) => {
+    const d = dialog(`
+      <form class="form" method="dialog">
+        <h3>${r.name ? 'Meldingsregel bewerken' : 'Nieuwe meldingsregel'}</h3>
+        <div class="row">
+          <label>Naam<input name="name" required maxlength="100" value="${esc(r.name)}" placeholder="bijv. Klant X — sms bij storing"></label>
+          <label class="check" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="enabled" ${r.enabled ? 'checked' : ''}> Actief</label>
+        </div>
+
+        <fieldset class="channel on"><legend>Geldt voor</legend>
+          <div class="row">
+            <label>Servers / websites<select name="scope">
+              <option value="all">Alle servers en websites</option>
+              <option value="servers">Gekozen servers (met hun websites)</option>
+              <option value="websites">Gekozen websites</option></select></label>
+            <label>Soort melding<select name="kind">
+              <option value="">Servers en websites</option><option value="server">Alleen servermeldingen</option><option value="site">Alleen websitemeldingen</option></select></label>
+          </div>
+          <div id="rPick">
+            <input type="search" id="rSearch" placeholder="Zoek…" style="margin-bottom:8px">
+            <div class="discover" style="max-height:30vh">${byServer.map((s) => `
+              <div class="disc-server" data-name="${esc(s.name.toLowerCase())}">
+                <label class="check disc-head" data-pick="servers"><input type="checkbox" name="servers" value="${s.id}" ${r.servers.includes(s.id) ? 'checked' : ''}> <b>${esc(s.name)}</b></label>
+                <b class="disc-head" data-pick="websites-head">${esc(s.name)}</b>
+                ${s.sites.map((w) => `<label class="check disc-item" data-pick="websites" data-d="${esc(w.domain)}">
+                  <input type="checkbox" name="websites" value="${w.id}" ${r.websites.includes(w.id) ? 'checked' : ''}> ${esc(w.domain)}</label>`).join('')}
+              </div>`).join('') || '<p class="muted">Nog geen servers.</p>'}</div>
+          </div>
+          <div class="row">
+            <label>Vanaf niveau<select name="minLevel"><option value="warn">Waarschuwing + kritiek</option><option value="crit">Alleen kritiek</option></select></label>
+            <label>Wanneer<select name="when"><option value="always">Altijd</option><option value="work">Alleen binnen werktijden</option><option value="offhours">Alleen buiten werktijden</option></select></label>
+          </div>
+          <div id="rWork" class="row">
+            <div><span class="note">Werktijden</span><div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">${DAYS.map(([v, l]) => `<label class="check"><input type="checkbox" name="days" value="${v}" ${r.days.includes(v) ? 'checked' : ''}> ${l}</label>`).join('')}</div></div>
+            <div class="row"><label>Van<input type="time" name="from" value="${esc(r.from)}"></label><label>Tot<input type="time" name="until" value="${esc(r.until)}"></label></div>
+          </div>
+        </fieldset>
+
+        <fieldset class="channel on"><legend>Versturen naar</legend>
+          <div style="display:flex;gap:14px;flex-wrap:wrap">${chBoxes('channels', r.channels)}</div>
+          <div class="row">${toFields('to', r.to)}</div>
+          <label class="check"><input type="checkbox" name="exclusive" ${r.exclusive ? 'checked' : ''}>
+            <span>Standaardkanalen <b>niet</b> gebruiken voor deze servers/websites (alleen deze regel; zonder kanalen = stil)</span></label>
+        </fieldset>
+
+        <fieldset class="channel on"><legend>Escalatie</legend>
+          <label>Na hoeveel minuten zonder bevestiging escaleren? (0 = geen escalatie)
+            <input type="number" min="0" max="1440" name="escMinutes" value="${r.escalate.minutes || 0}"></label>
+          <div id="rEsc">
+            <div style="display:flex;gap:14px;flex-wrap:wrap">${chBoxes('escChannels', r.escalate.channels)}</div>
+            <div class="row">${toFields('esc', r.escalate.to)}</div>
+          </div>
+        </fieldset>
+
+        <div class="form-error"></div>
+        <div class="actions">
+          <button type="button" class="btn ghost" id="rTest" style="margin-right:auto">Test versturen</button>
+          <button class="btn ghost" value="cancel" formnovalidate>Annuleren</button>
+          <button class="btn" value="ok">Opslaan</button>
+        </div>
+      </form>`);
+    d.style.width = 'min(820px, 96vw)';
+    const form = $('form', d);
+    form.scope.value = r.scope;
+    form.kind.value = r.kind;
+    form.minLevel.value = r.minLevel;
+    form.when.value = r.when;
+
+    const checked = (name) => $$(`input[name="${name}"]:checked`, form).map((b) => b.value);
+    const sync = () => {
+      const scope = form.scope.value;
+      $('#rPick', d).classList.toggle('hidden', scope === 'all');
+      $$('[data-pick="servers"]', d).forEach((x) => x.classList.toggle('hidden', scope !== 'servers'));
+      $$('[data-pick="websites"], [data-pick="websites-head"]', d).forEach((x) => x.classList.toggle('hidden', scope !== 'websites'));
+      $('#rWork', d).classList.toggle('hidden', form.when.value === 'always');
+      $('#rEsc', d).classList.toggle('hidden', !(+form.escMinutes.value > 0));
+      // ontvanger-velden alleen voor de gekozen kanalen
+      for (const [prefix, name] of [['to', 'channels'], ['esc', 'escChannels']]) {
+        const on = checked(name);
+        $$(`[data-to^="${prefix}."]`, d).forEach((x) => x.classList.toggle('hidden', !on.includes(x.dataset.to.split('.')[1])));
+      }
+    };
+    form.addEventListener('change', sync);
+    form.addEventListener('input', (e) => { if (e.target.name === 'escMinutes') sync(); });
+    $('#rSearch', d).oninput = (e) => {
+      const q = e.target.value.toLowerCase();
+      $$('.disc-server', d).forEach((el) => {
+        const items = $$('.disc-item', el);
+        items.forEach((x) => x.classList.toggle('filtered', !!q && !x.dataset.d.includes(q) && !el.dataset.name.includes(q)));
+        el.classList.toggle('filtered', !!q && !el.dataset.name.includes(q) && items.every((x) => x.classList.contains('filtered')));
+      });
+    };
+    sync();
+
+    const collect = () => {
+      const fd = new FormData(form);
+      const to = (prefix, chs) => Object.fromEntries(RULE_TO.filter(([ch]) => chs.includes(ch)).map(([ch]) => [ch, fd.get(`${prefix}.${ch}`) || '']));
+      const channels = checked('channels'), escChannels = checked('escChannels');
+      return {
+        id: r.id, name: fd.get('name'), enabled: fd.get('enabled') === 'on',
+        scope: fd.get('scope'), kind: fd.get('kind'), minLevel: fd.get('minLevel'),
+        servers: fd.get('scope') === 'servers' ? checked('servers').map(Number) : [],
+        websites: fd.get('scope') === 'websites' ? checked('websites').map(Number) : [],
+        when: fd.get('when'), days: checked('days').map(Number), from: fd.get('from'), until: fd.get('until'),
+        channels, to: to('to', channels), exclusive: fd.get('exclusive') === 'on',
+        escalate: { minutes: +fd.get('escMinutes') || 0, channels: escChannels, to: to('esc', escChannels) },
+      };
+    };
+    const err = (t, ok) => { const el = $('.form-error', d); el.style.color = ok ? 'var(--success-500)' : ''; el.textContent = t; };
+
+    $('#rTest', d).onclick = async (e) => {
+      const b = e.currentTarget;
+      b.disabled = true;
+      try {
+        const res = await api('/settings/test-rule', { method: 'POST', body: { rule: collect() } });
+        err(`Testmelding verstuurd via ${res.sent.map((c) => CH_LABEL[c]).join(', ')} ✓`, true);
+      } catch (ex) { err(ex.message); } finally { b.disabled = false; }
+    };
+    form.addEventListener('submit', (e) => {
+      if (e.submitter?.value === 'cancel') return resolve(null);
+      e.preventDefault();
+      const out = collect();
+      if (out.scope === 'servers' && !out.servers.length) return err('Kies minstens één server');
+      if (out.scope === 'websites' && !out.websites.length) return err('Kies minstens één website');
+      if (out.when !== 'always' && !out.days.length) return err('Kies minstens één dag');
+      if (!out.channels.length && !out.exclusive && !out.escalate.channels.length) return err('Kies minstens één kanaal (of zet "standaardkanalen niet gebruiken" aan om deze servers stil te zetten)');
+      if (out.escalate.minutes && !out.escalate.channels.length) return err('Kies een kanaal voor de escalatie');
+      d.close();
+      resolve(out);
+    });
+    d.addEventListener('cancel', () => resolve(null));
+  });
+}
+
 function drawNotifySettings(el, s) {
   const n = s.notify;
   el.innerHTML = `

@@ -691,6 +691,7 @@ function renderDetail(id) {
       ['TCP-check', d.reach ? `${d.reach.ok ? `OK, poort ${d.reach.port} in ${d.reach.ms} ms` : `MISLUKT (${d.reach.error || 'geen verbinding'}) op ${d.reach.ports.join(', ')}`} · ${d.reach.host} · ${fmt.ago(d.reach.ts)}`
         : d.reachTarget ? 'wacht op eerste controle' : 'uit (geen hostname)'],
       ['Afwijkende drempels', overridesText(d.config?.thresholds)],
+      ['Meldingen', rulesText(d.rules)],
       ['Notities', d.notes],
     ].filter(([, v]) => v);
     $('#infoPanel').innerHTML = `
@@ -1159,7 +1160,8 @@ function renderWebsite(id) {
           <button class="btn danger small admin-only" id="delSite">Verwijderen</button>
         </div>
       </div>
-      <div class="dsub">${[s?.user && `gebruiker ${esc(s.user)}`, s?.docroot && esc(s.docroot), d.stats_ts && `data ${fmt.ago(d.stats_ts)}`].filter(Boolean).join(' · ')}</div>
+      <div class="dsub">${[s?.user && `gebruiker ${esc(s.user)}`, s?.docroot && esc(s.docroot), d.stats_ts && `data ${fmt.ago(d.stats_ts)}`,
+        d.rules?.length && `meldingen: ${esc(rulesText(d.rules))}`].filter(Boolean).join(' · ')}</div>
       ${issues.length ? `<div class="alert ${d.status.real === 'crit' ? '' : 'warn'}"><ul class="issues">${issues.map((i) => `<li class="${i.level}">${esc(i.msg)}</li>`).join('')}</ul></div>` : ''}`;
 
     const chk = $('#checkNow');
@@ -1263,6 +1265,13 @@ const TH_ROWS = [
   ['dbConn', 'Database-verbindingen', '% van max_connections'], ['replLag', 'Replicatie-achterstand', 'seconden'],
   ['longQuery', 'Langlopende query', 'seconden'], ['secUpdates', 'Security-updates', 'aantal (0 = alleen tonen, geen melding)'],
 ];
+
+/** Welke meldingsregels gelden, bijv. "standaard + regel 'Klant X sms'" (leeg als alleen de standaard geldt). */
+function rulesText(rules) {
+  if (!rules?.length) return '';
+  const names = rules.map((r) => `'${r.name}'`).join(', ');
+  return `${rules.some((r) => r.exclusive) ? 'alleen' : 'standaard +'} regel${rules.length > 1 ? 's' : ''} ${names}`;
+}
 
 /** Korte tekst van de afwijkende drempels van een server, bijv. "CPU 95/99 · Schijfruimte 90/97". */
 function overridesText(o) {
@@ -1399,6 +1408,7 @@ async function renderAdmin() {
       <div class="table-wrap" id="srvTable"><p class="muted">Laden…</p></div>
     </section>
     <section class="panel" id="notifyPanel"></section>
+    <section class="panel" id="rulesPanel"></section>
     <section class="panel">
       <h3>Drempelwaarden</h3>
       <form id="thForm" class="form"></form>
@@ -1507,6 +1517,7 @@ async function renderAdmin() {
       loadSettings();
     };
     drawNotifySettings($('#notifyPanel'), s);
+    drawRulesSettings($('#rulesPanel'), s);
     drawGeneralSettings($('#generalPanel'), s);
   }
 

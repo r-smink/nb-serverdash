@@ -419,6 +419,7 @@ details[open] summary { color: var(--text-default); }
 .disc-server { margin-bottom: 12px; }
 .disc-head { position: sticky; top: -8px; background: var(--surface-card); padding: 6px 0; }
 .disc-item { padding: 3px 0 3px 12px; font-size: var(--text-sm); }
+.discover .filtered { display: none; }
 
 /* ---------- tv-modus ---------- */
 body.tv .topbar { display: none; }
