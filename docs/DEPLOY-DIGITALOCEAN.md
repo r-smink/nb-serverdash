@@ -374,6 +374,7 @@ Alle commando's voer je uit vanuit `/opt/serverdash`.
 
 | Probleem | Oorzaak en oplossing |
 |---|---|
+| `permission denied while trying to connect to the docker API` | Je gebruiker zit nog niet (actief) in de groep `docker`. Voer `sudo usermod -aG docker $USER` uit, log uit en weer in, en controleer met `groups`. Draait Docker wel? Controleer met `sudo systemctl status docker`. |
 | Caddy krijgt geen certificaat | Het A-record wijst nog niet naar de droplet, of poort 80 of 443 is dicht. Controleer `nslookup` en `sudo ufw status`, en bekijk `docker compose logs caddy`. |
 | Browser toont "502 Bad Gateway" | De container `serverdash` draait niet. Bekijk `docker compose logs serverdash`. Vaak is het een rechtenprobleem op `data/` (zie stap 6). |
 | `SQLITE_CANTOPEN` of `permission denied` in de logs | Voer `sudo chown -R 1000:1000 data` uit. |
