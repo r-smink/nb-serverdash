@@ -194,6 +194,7 @@ if (addColumn('events', 'website_id', 'INTEGER')) {
     WHERE message LIKE 'Website %'`);
 }
 db.exec('CREATE INDEX IF NOT EXISTS events_website ON events (website_id, ts)');
+addColumn('incidents', 'notify_state', 'TEXT');   // JSON: { sent: [regel-id's of 'default'], esc: [regel-id's] }
 
 export const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -549,7 +550,7 @@ export const deleteUser = (id) => db.prepare('DELETE FROM users WHERE id = ?').r
 
 // ---------- incidenten ----------
 
-const INC_COLS = 'id, kind, entity_id, server_id, title, level, summary, started, ended, last_notified, ack_user, ack_ts, cause';
+const INC_COLS = 'id, kind, entity_id, server_id, title, level, summary, started, ended, last_notified, ack_user, ack_ts, cause, notify_state';
 export const openIncident = (kind, entityId) =>
   db.prepare(`SELECT ${INC_COLS} FROM incidents WHERE kind = ? AND entity_id = ? AND ended IS NULL ORDER BY id DESC LIMIT 1`).get(kind, entityId);
 export const openIncidents = () => db.prepare(`SELECT ${INC_COLS} FROM incidents WHERE ended IS NULL`).all();
@@ -560,7 +561,7 @@ export function createIncident(i) {
   return getIncident(Number(lastInsertRowid));
 }
 export function updateIncident(id, fields) {
-  const allowed = ['level', 'summary', 'ended', 'last_notified', 'ack_user', 'ack_ts', 'cause', 'title'];
+  const allowed = ['level', 'summary', 'ended', 'last_notified', 'ack_user', 'ack_ts', 'cause', 'title', 'notify_state'];
   for (const [k, v] of Object.entries(fields)) {
     if (allowed.includes(k)) db.prepare(`UPDATE incidents SET ${k} = ? WHERE id = ?`).run(v ?? null, id);
   }

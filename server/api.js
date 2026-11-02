@@ -5,7 +5,7 @@ import * as store from './db.js';
 import * as auth from './auth.js';
 import * as mon from './monitor.js';
 import { DEFAULT_THRESHOLDS, mergeThresholds, cleanOverrides } from './status.js';
-import { maskedNotifyConfig, saveNotifyConfig, notify } from './alerts.js';
+import { maskedNotifyConfig, saveNotifyConfig, notify, getRules, saveRules, testRule, rulesFor } from './alerts.js';
 import { diskForecast, wordpressOverview, refreshWporg, cmpVersion } from './insights.js';
 
 const { nowSec } = store;
@@ -256,7 +256,7 @@ on('GET', '/api/servers/:id', ({ params }) => {
     return { ...f, total: d?.total ?? null, bytesPerDay: d && f.perDay != null ? (f.perDay / 100) * d.total : null };
   });
   return {
-    ...mon.serverSummary(s, th, now), defaultThresholds: th, payload: p, events: store.serverEvents(s.id, 50), websites,
+    ...mon.serverSummary(s, th, now), defaultThresholds: th, payload: p, rules: rulesFor({ kind: 'server', id: s.id, serverId: s.id }), events: store.serverEvents(s.id, 50), websites,
     forecast, reach: mon.reachOf(s), reachTarget: mon.reachTarget(s),
     backups: extra.backups || null, updates: extra.updates || null, dbs: extra.dbs || null, dbs_ts: extra.dbs_ts || null,
     wordpress: (extra.wordpress?.sites || []).length,
@@ -416,6 +416,7 @@ on('GET', '/api/websites/:id', ({ params }) => {
   const sp = server && mon.payloadOf(server);
   return {
     ...summary,
+    rules: rulesFor({ kind: 'site', id: w.id, serverId: w.server_id }),
     fullStats: mon.parse(w.last_stats),
     uptime7d: store.uptimeSince(w.id, now - 7 * 86400),
     uptime30d: store.uptimeSince(w.id, now - 30 * 86400),
@@ -625,6 +626,12 @@ on('GET', '/api/settings', () => ({
   defaults: DEFAULT_THRESHOLDS,
   enlargeProblems: store.getSetting('enlargeProblems', true),
   notify: maskedNotifyConfig(),
+  rules: getRules(),
+  // keuzelijsten voor de meldingsregels
+  ruleOptions: {
+    servers: store.listServers().map((s) => ({ id: s.id, name: s.name })),
+    websites: store.listWebsites().map((w) => ({ id: w.id, domain: w.domain, server_id: w.server_id })),
+  },
   autoSites: store.getSetting('autoSites', { enabled: false, check: true }),
   heartbeatUrl: store.getSetting('heartbeatUrl', ''),
   publicUrl: config.publicUrl,
@@ -635,6 +642,9 @@ on('PUT', '/api/settings', ({ body }) => {
   if (body.enlargeProblems !== undefined) store.setSetting('enlargeProblems', !!body.enlargeProblems);
   if (body.notify) {
     try { saveNotifyConfig(body.notify); } catch (e) { throw new HttpError(400, e.message); }
+  }
+  if (body.rules) {
+    try { saveRules(body.rules); } catch (e) { throw new HttpError(400, e.message); }
   }
   if (body.autoSites) store.setSetting('autoSites', { enabled: !!body.autoSites.enabled, check: body.autoSites.check !== false });
   if (body.heartbeatUrl !== undefined) {
@@ -653,6 +663,20 @@ on('POST', '/api/settings/test-notify', async ({ body }) => {
   if (!results.length) throw new HttpError(400, 'Onbekend kanaal');
   if (!results[0].ok) throw new HttpError(400, `Mislukt: ${results[0].error}`);
   return { ok: true };
+});
+
+/** Testmelding naar de kanalen (en escalatiekanalen) van één regel, ook als die nog niet is opgeslagen. */
+on('POST', '/api/settings/test-rule', async ({ body }) => {
+  let results;
+  try {
+    results = await testRule(body.rule || {}, {
+      level: 'warn', title: `🧪 Testmelding regel "${String(body.rule?.name || '').slice(0, 100)}"`,
+      text: 'Als je dit leest, komt deze meldingsregel bij je aan.', url: config.publicUrl || '',
+    });
+  } catch (e) { throw new HttpError(e.status || 500, e.message); }
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length) throw new HttpError(400, `Mislukt: ${failed.map((r) => `${r.channel}: ${r.error}`).join('; ')}`);
+  return { ok: true, sent: results.map((r) => r.channel) };
 });
 
 // ---------- achtergrondtaken ----------
