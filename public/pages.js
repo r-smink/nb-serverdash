@@ -777,8 +777,9 @@ function renderTv() {
     const b = $('#tvSound');
     if (!b) return;
     const blocked = soundOn() && !soundReady();
-    b.textContent = !soundOn() ? '🔕 Geluid uit' : blocked ? '🔇 Klik voor geluid' : '🔔 Geluid aan';
-    b.title = (blocked ? 'De browser laat pas geluid toe na een klik op de pagina' : 'Geluid bij nieuwe problemen en bij herstel')
+    b.textContent = !soundOn() ? '🔕' : blocked ? '🔇' : '🔔';
+    b.title = (!soundOn() ? 'Geluid uit — klik om aan te zetten' : blocked ? 'Geluid aan, maar de browser laat pas geluid toe na een klik op de pagina'
+      : 'Geluid aan bij nieuwe problemen en bij herstel — klik om uit te zetten')
       + (lastSound ? `\nLaatste geluid: ${lastSound}` : '');
     b.classList.toggle('lvl-warn', blocked);
   };
@@ -835,6 +836,7 @@ function renderTv() {
         ${probS.map((s) => `<a class="tv-card lvl-${s.status.level}" href="#/server/${s.id}">
           <div class="tv-card-head"><span class="dot"></span>${esc(s.name)}<span class="badge">${TYPES[s.type] || ''}</span></div>
           <ul class="issues">${s.status.issues.filter((i) => i.level === 'crit' || i.level === 'warn').slice(0, 4).map((i) => `<li class="${i.level}">${esc(i.msg)}</li>`).join('')}</ul>
+          ${s.notes ? `<div class="tv-notes">${esc(s.notes)}</div>` : ''}
           ${s.summary && !s.status.offline ? `<div class="tv-mini">CPU ${fmt.pct(s.summary.cpu)} · RAM ${fmt.pct(s.summary.mem_pct)} · Disk ${fmt.pct(s.summary.disk?.pct)}</div>` : ''}
         </a>`).join('')}
         ${probW.map((w) => `<a class="tv-card lvl-${w.status.level}" href="#/website/${w.id}">
@@ -847,6 +849,7 @@ function renderTv() {
       const m = s.summary;
       return `<a class="tv-mini-tile lvl-${s.status.level}" href="#/server/${s.id}">
         <div class="tv-mini-name"><span class="dot"></span>${esc(s.name)}</div>
+        ${s.notes ? `<div class="tv-mini-notes" title="${esc(s.notes)}">${esc(s.notes)}</div>` : ''}
         ${m && !s.status.offline ? `<div class="tv-bars">
           <span title="CPU"><i style="width:${Math.min(100, m.cpu || 0)}%" class="${lvlFor(m.cpu, (s.thresholds || d.thresholds).cpu)}"></i></span>
           <span title="RAM"><i style="width:${Math.min(100, m.mem_pct || 0)}%" class="${lvlFor(m.mem_pct, (s.thresholds || d.thresholds).mem)}"></i></span>
