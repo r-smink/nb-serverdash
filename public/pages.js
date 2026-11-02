@@ -381,6 +381,160 @@ function renderIncidents() {
   if (m) incidentDialog(+m[1]).then(() => { load(); updateIncidentBadge(); });
 }
 
+// ---------- meldingen ----------
+
+const EVENT_LEVELS = { crit: 'Kritiek', warn: 'Waarschuwing', ok: 'Hersteld / info' };
+
+function renderEvents() {
+  const nav = view.nav;
+  const saved = prefs.events || {};
+  // Deeplink vanaf een server- of websitepagina: #/meldingen?server=3 of ?website=7
+  const qs = new URLSearchParams(location.hash.split('?')[1] || '');
+  const st = {
+    range: saved.range || 7 * 86400, kind: saved.kind || '', level: saved.level || '', q: '',
+    server: +qs.get('server') || (qs.has('website') ? 0 : saved.server || 0),
+    website: +qs.get('website') || (qs.has('server') ? 0 : saved.website || 0),
+    list: [], more: false, meta: null,
+  };
+  const save = () => { prefs.events = { range: st.range, kind: st.kind, level: st.level, server: st.server, website: st.website }; savePrefs(); };
+
+  main.innerHTML = `
+    <div class="page-head">
+      <div><h1>Meldingen</h1><p>Alle statuswijzigingen van servers en websites: problemen, waarschuwingen en herstel.</p></div>
+      <div class="right">${segHtml('evRange', [[86400, '24u'], [7 * 86400, '7d'], [30 * 86400, '30d'], [90 * 86400, '90d'], [365 * 86400, '1j']], st.range)}</div>
+    </div>
+    <div class="toolbar">
+      <div class="summary" id="evCounts"></div>
+      <div class="filters">
+        <select id="evServer"><option value="0">Alle servers</option></select>
+        <select id="evWebsite"><option value="0">Alle websites</option></select>
+        <select id="evKind">
+          <option value="">Servers &amp; websites</option><option value="server">Alleen servermeldingen</option><option value="site">Alleen websitemeldingen</option>
+        </select>
+        <input id="evSearch" type="search" placeholder="Zoek in meldingen…">
+      </div>
+    </div>
+    <section class="panel" id="evPanel" style="margin-top:0"><p class="muted">Laden…</p></section>`;
+
+  $('#evKind').value = st.kind;
+  onSeg('evRange', (v) => { st.range = +v; save(); load(); });
+  $('#evServer').onchange = (e) => {
+    st.server = +e.target.value;
+    // website hoort bij een andere server: filter op website loslaten
+    if (st.website && st.meta?.websites.find((w) => w.id === st.website)?.server_id !== st.server && st.server) st.website = 0;
+    save(); fillSelects(); load();
+  };
+  $('#evWebsite').onchange = (e) => {
+    st.website = +e.target.value;
+    if (st.website) st.kind = 'site';
+    $('#evKind').value = st.kind;
+    save(); load();
+  };
+  $('#evKind').onchange = (e) => {
+    st.kind = e.target.value;
+    if (st.kind === 'server') { st.website = 0; fillSelects(); }
+    save(); load();
+  };
+  let searchTimer;
+  $('#evSearch').oninput = (e) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { st.q = e.target.value.trim(); load(); }, 300);
+  };
+  $('#evCounts').onclick = (e) => {
+    const b = e.target.closest('button[data-level]');
+    if (!b) return;
+    st.level = st.level === b.dataset.level ? '' : b.dataset.level;
+    save(); load();
+  };
+
+  const params = (before) => {
+    const p = new URLSearchParams({ range: st.range });
+    if (st.server) p.set('server', st.server);
+    if (st.website) p.set('website', st.website);
+    if (st.kind) p.set('kind', st.kind);
+    if (st.level) p.set('level', st.level);
+    if (st.q) p.set('q', st.q);
+    if (before) p.set('before', before);
+    return p;
+  };
+
+  function fillSelects() {
+    const m = st.meta;
+    if (!m) return;
+    $('#evServer').innerHTML = `<option value="0">Alle servers</option>`
+      + [...m.servers].sort(byName).map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+    $('#evServer').value = st.server;
+    const sites = m.websites.filter((w) => !st.server || w.server_id === st.server)
+      .sort((a, b) => a.domain.localeCompare(b.domain));
+    $('#evWebsite').innerHTML = `<option value="0">${st.server ? 'Alle websites op deze server' : 'Alle websites'}</option>`
+      + sites.map((w) => `<option value="${w.id}">${esc(w.domain)}</option>`).join('');
+    $('#evWebsite').value = st.website;
+    $('#evWebsite').disabled = st.kind === 'server';
+  }
+
+  function drawCounts(c) {
+    const chip = (lvl, n, label) => `<button type="button" data-level="${lvl}" class="chip ${lvl} ${n && lvl !== 'ok' ? 'has' : ''} ${st.level === lvl ? 'on' : ''}"
+      title="Klik om alleen deze meldingen te tonen">${n} ${label}</button>`;
+    $('#evCounts').innerHTML = `<span class="chip">${c.total} meldingen</span>`
+      + chip('crit', c.crit, 'kritiek') + chip('warn', c.warn, 'waarschuwing') + chip('ok', c.ok, 'hersteld');
+  }
+
+  function rowHtml(e) {
+    return `<tr>
+      <td class="muted" style="white-space:nowrap">${fmt.time(e.ts)}</td>
+      <td style="white-space:nowrap">${dotCell(e.level, EVENT_LEVELS[e.level] || esc(e.level))}</td>
+      <td>${e.server_name ? `<a href="#/server/${e.server_id}">${esc(e.server_name)}</a>` : '<span class="muted">verwijderd</span>'}</td>
+      <td>${e.website_id ? (e.website_domain ? `<a href="#/website/${e.website_id}">${esc(e.website_domain)}</a>` : '<span class="muted">verwijderd</span>') : ''}</td>
+      <td>${esc(e.message)}</td>
+    </tr>`;
+  }
+
+  function draw() {
+    const filtered = st.server || st.website || st.kind || st.level || st.q;
+    $('#evPanel').innerHTML = `<div class="table-wrap" style="max-height:none"><table>
+      <thead><tr><th>Tijd</th><th>Status</th><th>Server</th><th>Website</th><th>Melding</th></tr></thead>
+      <tbody>${st.list.map(rowHtml).join('')
+        || `<tr><td colspan="5" class="muted">${filtered ? 'Geen meldingen die aan de filters voldoen.' : 'Geen meldingen in deze periode 🎉'}</td></tr>`}</tbody>
+    </table></div>
+    ${st.more ? '<div class="actions" style="margin-top:12px"><button class="btn ghost small" id="evMore">Meer laden</button></div>' : ''}`;
+    const more = $('#evMore');
+    if (more) more.onclick = loadMore;
+  }
+
+  async function load() {
+    try {
+      const d = await api(`/events?${params()}`);
+      if (nav !== view.nav) return;
+      st.meta = { servers: d.servers, websites: d.websites };
+      // gefilterde server/website bestaat niet meer: filter loslaten
+      if (st.server && !d.servers.some((s) => s.id === st.server)) st.server = 0;
+      if (st.website && !d.websites.some((w) => w.id === st.website)) st.website = 0;
+      fillSelects();
+      st.list = d.events;
+      st.more = d.more;
+      drawCounts(d.counts);
+      draw();
+      setConn(true);
+    } catch (e) { setConn(false, e.message); }
+  }
+
+  async function loadMore() {
+    const last = st.list[st.list.length - 1];
+    if (!last) return;
+    try {
+      const d = await api(`/events?${params(`${last.ts}:${last.id}`)}`);
+      if (nav !== view.nav) return;
+      st.list = st.list.concat(d.events);
+      st.more = d.more;
+      draw();
+    } catch (e) { setConn(false, e.message); }
+  }
+
+  load();
+  // alleen verversen zolang er niet verder gescrold/geladen is
+  view.timers.push(setInterval(() => { if (st.list.length <= 200) load(); }, 30_000));
+}
+
 async function incidentDialog(id) {
   let data;
   try { data = await api(`/incidents/${id}`); } catch (e) { alert(e.message); return; }

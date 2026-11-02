@@ -135,7 +135,7 @@ function track(key, entity, eventServerId, eventPrefix, status, now, silent) {
   if (prev === lvl) { if (lvl !== 'ok') handleTransition(entity, prev, lvl, status, now, true); return; }
   if ((prev === 'muted' || prev === 'pending') && lvl === 'ok') return;
   const text = lvl === 'ok' ? 'hersteld — alles weer binnen de drempels' : `${LEVEL_TEXT[lvl].toLowerCase()} — ${problems(status)}`;
-  store.addEvent(eventServerId, now, lvl, `${eventPrefix}${text.charAt(0).toUpperCase()}${text.slice(1)}`);
+  store.addEvent(eventServerId, now, lvl, `${eventPrefix}${text.charAt(0).toUpperCase()}${text.slice(1)}`, entity.kind === 'site' ? entity.id : null);
   handleTransition(entity, prev, lvl, status, now, false);
 }
 
@@ -270,8 +270,8 @@ export function ingest(s, body) {
     const known = new Set(store.listWebsites().map((w) => w.domain));
     for (const d of extra.domains) {
       if (known.has(d) || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) continue;
-      store.createWebsite({ server_id: s.id, domain: d, url: `https://${d}/`, keyword: '', check_enabled: auto.check !== false, notes: 'Automatisch toegevoegd' });
-      store.addEvent(s.id, now, 'ok', `Website ${d} automatisch toegevoegd aan de monitoring`);
+      const w = store.createWebsite({ server_id: s.id, domain: d, url: `https://${d}/`, keyword: '', check_enabled: auto.check !== false, notes: 'Automatisch toegevoegd' });
+      store.addEvent(s.id, now, 'ok', `Website ${d} automatisch toegevoegd aan de monitoring`, w.id);
     }
   }
 

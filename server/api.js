@@ -546,6 +546,31 @@ function decorateIncident(inc, byId) {
   return { ...inc, server: byId.get(inc.server_id)?.name || null };
 }
 
+// ---------- meldingen ----------
+
+/** Alle meldingen (statuswijzigingen van servers en websites), te filteren op server, website, soort en level. */
+on('GET', '/api/events', ({ query }) => {
+  const id = (k) => Math.max(0, Math.floor(+query.get(k) || 0)) || null;
+  const filters = {
+    from: nowSec() - rangeParam(query, 7 * 86400, 400 * 86400),
+    serverId: id('server'),
+    websiteId: id('website'),
+    kind: ['server', 'site'].includes(query.get('kind')) ? query.get('kind') : null,
+    level: ['crit', 'warn', 'ok'].includes(query.get('level')) ? query.get('level') : null,
+    q: String(query.get('q') || '').trim().slice(0, 100) || null,
+  };
+  const before = String(query.get('before') || '').split(':').map(Number);
+  const limit = 200;
+  const events = store.listEvents({ ...filters, before: before.length === 2 && before.every(Number.isFinite) ? before : null }, limit + 1);
+  return {
+    events: events.slice(0, limit),
+    more: events.length > limit,
+    counts: query.get('before') ? null : store.countEvents(filters),
+    servers: store.listServers().map((s) => ({ id: s.id, name: s.name })),
+    websites: store.listWebsites().map((w) => ({ id: w.id, domain: w.domain, server_id: w.server_id })),
+  };
+});
+
 on('GET', '/api/incidents', ({ query }) => {
   const range = rangeParam(query, 30 * 86400, 365 * 86400);
   const byId = new Map(store.listServers().map((s) => [s.id, s]));

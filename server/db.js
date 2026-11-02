@@ -179,12 +179,21 @@ CREATE TABLE IF NOT EXISTS security_hourly (
 /** Kolom toevoegen aan een bestaande tabel (migratie), stil als hij al bestaat. */
 function addColumn(table, column, type) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-  if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  if (cols.includes(column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  return true;
 }
 addColumn('servers', 'config', 'TEXT');        // JSON: { ports, backup }
 addColumn('servers', 'extra', 'TEXT');         // JSON: traag veranderende agentdata (backups, updates, wordpress, …)
 addColumn('servers', 'reach', 'TEXT');         // JSON: laatste TCP-check
 for (const c of ['db_conns', 'db_running', 'db_qps', 'db_slow']) addColumn('metrics', c, 'REAL');
+if (addColumn('events', 'website_id', 'INTEGER')) {
+  // Oudere websitemeldingen hebben alleen de tekst "Website <domein>: …"; koppel ze eenmalig aan de website.
+  db.exec(`UPDATE events SET website_id = (
+      SELECT w.id FROM websites w WHERE events.server_id = w.server_id AND substr(events.message, 1, length(w.domain) + 9) = 'Website ' || w.domain || ':')
+    WHERE message LIKE 'Website %'`);
+}
+db.exec('CREATE INDEX IF NOT EXISTS events_website ON events (website_id, ts)');
 
 export const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -384,15 +393,49 @@ export function snapshotNear(serverId, ts) {
 
 // ---------- events ----------
 
-const qAddEvent = db.prepare('INSERT INTO events (server_id, ts, level, message) VALUES (?, ?, ?, ?)');
+const qAddEvent = db.prepare('INSERT INTO events (server_id, ts, level, message, website_id) VALUES (?, ?, ?, ?, ?)');
 const qRecentEvents = db.prepare(`
   SELECT e.id, e.server_id, e.ts, e.level, e.message, s.name AS server_name
   FROM events e JOIN servers s ON s.id = e.server_id ORDER BY e.ts DESC, e.id DESC LIMIT ?`);
 const qServerEvents = db.prepare('SELECT id, ts, level, message FROM events WHERE server_id = ? ORDER BY ts DESC, id DESC LIMIT ?');
 
-export const addEvent = (serverId, ts, level, message) => qAddEvent.run(serverId, ts, level, message);
+export const addEvent = (serverId, ts, level, message, websiteId = null) => qAddEvent.run(serverId, ts, level, message, websiteId);
 export const recentEvents = (limit = 30) => qRecentEvents.all(limit);
 export const serverEvents = (serverId, limit = 50) => qServerEvents.all(serverId, limit);
+
+/** WHERE-deel voor de meldingenfilters. kind: 'server' (alleen servermeldingen) of 'site' (alleen websitemeldingen). */
+function eventWhere({ from, serverId, websiteId, kind, level, q, before }) {
+  const where = ['e.ts >= ?'];
+  const params = [from];
+  if (serverId) { where.push('e.server_id = ?'); params.push(serverId); }
+  if (websiteId) { where.push('e.website_id = ?'); params.push(websiteId); }
+  if (kind === 'server') where.push('e.website_id IS NULL');
+  if (kind === 'site') where.push('e.website_id IS NOT NULL');
+  if (level) { where.push('e.level = ?'); params.push(level); }
+  if (q) { where.push("e.message LIKE ? ESCAPE '!'"); params.push(`%${q.replace(/[!%_]/g, '!$&')}%`); }
+  if (before) { where.push('(e.ts < ? OR (e.ts = ? AND e.id < ?))'); params.push(before[0], before[0], before[1]); }
+  return { sql: where.join(' AND '), params };
+}
+
+/** Meldingen met filters, nieuwste eerst. `before` = [ts, id] van de laatst getoonde melding (voor "meer laden"). */
+export function listEvents(filters, limit = 200) {
+  const { sql, params } = eventWhere(filters);
+  return db.prepare(`
+    SELECT e.id, e.ts, e.level, e.message, e.server_id, e.website_id, s.name AS server_name, w.domain AS website_domain
+    FROM events e LEFT JOIN servers s ON s.id = e.server_id LEFT JOIN websites w ON w.id = e.website_id
+    WHERE ${sql} ORDER BY e.ts DESC, e.id DESC LIMIT ?`).all(...params, limit);
+}
+
+/** Aantal meldingen per level binnen de filters (level en "meer laden" tellen niet mee). */
+export function countEvents(filters) {
+  const { sql, params } = eventWhere({ ...filters, level: null, before: null });
+  const out = { total: 0, crit: 0, warn: 0, ok: 0 };
+  for (const r of db.prepare(`SELECT e.level, COUNT(*) AS n FROM events e WHERE ${sql} GROUP BY e.level`).all(...params)) {
+    out.total += r.n;
+    if (r.level in out) out[r.level] = r.n;
+  }
+  return out;
+}
 
 // ---------- websites ----------
 

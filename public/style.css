@@ -166,6 +166,9 @@ label { display: grid; gap: 6px; color: var(--text-muted); font-size: var(--text
 .chip.ok::before { background: var(--ok); }
 .chip.crit.has { background: var(--crit-bg); border-color: var(--crit-soft); color: var(--crit-fg); }
 .chip.warn.has { background: var(--warn-bg); border-color: var(--warn-soft); color: var(--warn-fg); }
+button.chip { cursor: pointer; font-family: inherit; }
+button.chip:hover { border-color: var(--border-strong, var(--ink-400)); }
+.chip.on { box-shadow: 0 0 0 2px var(--text-strong); }
 .hint { color: var(--text-subtle); font-size: var(--text-xs); }
 
 /* ---------- server-tegels ---------- */

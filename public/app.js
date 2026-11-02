@@ -97,7 +97,7 @@ const isAdmin = () => me.role === 'admin';
 
 const PAGES = [
   ['#/websites', () => renderWebsites()], ['#/verbruik', () => renderUsage()], ['#/onderhoud', () => renderMaintenance()],
-  ['#/beveiliging', () => renderSecurity()], ['#/incidenten', () => renderIncidents()], ['#/beheer', () => renderAdmin()],
+  ['#/beveiliging', () => renderSecurity()], ['#/incidenten', () => renderIncidents()], ['#/meldingen', () => renderEvents()], ['#/beheer', () => renderAdmin()],
   ['#/account', () => renderAccount()], ['#/tv', () => renderTv()],
 ];
 
@@ -173,7 +173,7 @@ function renderOverview() {
       </div>
     </div>
     <div class="tile-groups" id="grid"><div class="empty">Laden…</div></div>
-    <section class="panel"><h3>Recente meldingen</h3><ul class="events" id="events"></ul></section>`;
+    <section class="panel"><div class="panel-head"><h3>Recente meldingen</h3><a class="right" href="#/meldingen">Alle meldingen →</a></div><ul class="events" id="events"></ul></section>`;
 
   $('#search').oninput = (e) => { prefs.search = e.target.value; savePrefs(); drawOverview(); };
   $('#typeFilter').onclick = (e) => {
@@ -490,7 +490,7 @@ function renderDetail(id) {
       <section class="panel" id="infoPanel"></section>
       <section class="panel">
         <h3>Incidenten (30 dagen)</h3><ul class="events compact" id="incList"></ul>
-        <h3 style="margin-top:16px">Meldingen</h3><ul class="events compact" id="eventList"></ul>
+        <div class="panel-head" style="margin-top:16px"><h3>Meldingen</h3><a class="right" href="#/meldingen?server=${id}">Alle meldingen →</a></div><ul class="events compact" id="eventList"></ul>
       </section>
     </div>`;
 
@@ -1151,6 +1151,7 @@ function renderWebsite(id) {
         <a class="badge" href="#/server/${d.server_id}">${esc(d.server?.name || '?')}</a>
         <span class="lvl-label">${LEVEL_LABEL[lvl]}</span>
         <div class="right" style="margin-left:auto;display:flex;gap:8px">
+          <a class="btn ghost small" href="#/meldingen?website=${id}">Meldingen</a>
           <a class="btn ghost small" href="${esc(d.url || `https://${d.domain}/`)}" target="_blank" rel="noopener noreferrer">Openen ↗</a>
           ${d.check_enabled ? '<button class="btn ghost small admin-only" id="checkNow">Nu controleren</button>' : ''}
           <button class="btn ghost small admin-only" id="editSite">Bewerken</button>
