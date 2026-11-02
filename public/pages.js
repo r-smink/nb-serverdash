@@ -679,6 +679,62 @@ async function renderAccount() {
 
 // ---------- tv-modus ----------
 
+// ---------- meldingsgeluid (tv-modus) ----------
+
+// Geluiden worden gesynthetiseerd met Web Audio, zodat er geen geluidsbestanden nodig zijn.
+// Elke toon: [frequentie Hz, start s, duur s, golfvorm]
+const SOUNDS = {
+  crit: [[880, 0, 0.18, 'square'], [660, 0.22, 0.18, 'square'], [880, 0.44, 0.18, 'square'], [660, 0.66, 0.18, 'square'], [880, 0.88, 0.3, 'square']],
+  warn: [[740, 0, 0.16, 'triangle'], [740, 0.26, 0.24, 'triangle']],
+  ok: [[523, 0, 0.14, 'sine'], [659, 0.12, 0.14, 'sine'], [784, 0.24, 0.32, 'sine']],
+};
+let audioCtx = null;
+
+/** Browsers staan geluid pas toe na een klik op de pagina; daarna blijft de AudioContext bruikbaar. */
+function soundReady() {
+  audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  return audioCtx.state === 'running';
+}
+
+function playSound(kind) {
+  soundReady();
+  const ctx = audioCtx;
+  const t0 = ctx.currentTime + 0.05;
+  for (const [freq, start, dur, type] of SOUNDS[kind]) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    // korte aan- en uitfade om klikjes te voorkomen; blokgolf zachter want die klinkt veel harder
+    const vol = type === 'square' ? 0.12 : 0.3;
+    gain.gain.setValueAtTime(0, t0 + start);
+    gain.gain.linearRampToValueAtTime(vol, t0 + start + 0.02);
+    gain.gain.setValueAtTime(vol, t0 + start + dur - 0.04);
+    gain.gain.linearRampToValueAtTime(0, t0 + start + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0 + start);
+    osc.stop(t0 + start + dur + 0.01);
+  }
+}
+
+/**
+ * Welk geluid hoort bij de overgangen tussen twee metingen? Eén geluid per verversing, het zwaarste:
+ * nieuw kritiek > nieuwe waarschuwing > hersteld. `prev` leeg = eerste meting, dan geen geluid.
+ */
+function soundForChanges(prev, next) {
+  if (!prev.size) return null;
+  let crit = false, warn = false, ok = false;
+  for (const [key, lvl] of next) {
+    const was = prev.get(key);
+    if (was === undefined || lvl === was) continue;
+    if (lvl === 'crit') crit = true;
+    else if (lvl === 'warn' && was !== 'crit') warn = true;
+    else if (lvl === 'ok' && (was === 'crit' || was === 'warn')) ok = true;
+  }
+  return crit ? 'crit' : warn ? 'warn' : ok ? 'ok' : null;
+}
+
 function renderTv() {
   const nav = view.nav;
   main.innerHTML = `
@@ -687,6 +743,7 @@ function renderTv() {
         <div class="brand"><span class="logo"></span>NextBuzz ServerDash</div>
         <div class="summary" id="tvSummary"></div>
         <div class="tv-clock" id="tvClock"></div>
+        <button type="button" class="btn ghost small" id="tvSound"></button>
         <a href="#/" class="btn ghost small" title="Sluiten (Esc)">✕</a>
       </div>
       <div id="tvProblems"></div>
@@ -699,10 +756,40 @@ function renderTv() {
   document.addEventListener('keydown', esc_);
   view.cleanup.push(() => document.removeEventListener('keydown', esc_));
 
+  // Geluid bij nieuwe problemen en herstel (staat standaard aan, per browser te wijzigen).
+  const soundOn = () => prefs.tvSound !== false;
+  const drawSoundBtn = () => {
+    const b = $('#tvSound');
+    if (!b) return;
+    const blocked = soundOn() && !soundReady();
+    b.textContent = !soundOn() ? '🔕 Geluid uit' : blocked ? '🔇 Klik voor geluid' : '🔔 Geluid aan';
+    b.title = blocked ? 'De browser laat pas geluid toe na een klik op de pagina' : 'Geluid bij nieuwe problemen en bij herstel';
+    b.classList.toggle('lvl-warn', blocked);
+  };
+  $('#tvSound').onclick = () => {
+    // Is geluid aan maar nog geblokkeerd, dan is deze klik genoeg om het vrij te geven.
+    if (soundOn() && !soundReady()) { setTimeout(drawSoundBtn, 100); return; }
+    prefs.tvSound = !soundOn();
+    savePrefs();
+    if (prefs.tvSound) playSound('ok');
+    drawSoundBtn();
+  };
+  drawSoundBtn();
+  // AudioContext komt pas vrij na een klik ergens op de pagina
+  const unlock = () => setTimeout(drawSoundBtn, 100);
+  document.addEventListener('click', unlock);
+  view.cleanup.push(() => document.removeEventListener('click', unlock));
+
+  let levels = new Map();   // 's:<id>' / 'w:<id>' -> level bij de vorige verversing
+
   async function load() {
     try {
       const d = await api('/tv');
       if (nav !== view.nav) return;
+      const next = new Map([...d.servers.map((s) => [`s:${s.id}`, s.status.level]), ...d.websites.map((w) => [`w:${w.id}`, w.status.level])]);
+      const sound = soundForChanges(levels, next);
+      levels = next;
+      if (sound && soundOn()) playSound(sound);
       draw(d);
     } catch { /* volgende poging */ }
   }
@@ -1129,7 +1216,16 @@ function drawGeneralSettings(el, s) {
         Kant-en-klaar script: <code>scripts/watchdog.sh</code> (zie README).</p>
       <div class="form-error" id="gMsg"></div>
       <div class="actions"><button class="btn">Opslaan</button></div>
-    </form>`;
+    </form>
+    <h3 style="margin-top:18px">Geluid in tv-modus</h3>
+    <p class="note">De tv-modus speelt een geluid zodra een server of website kritiek of waarschuwing wordt, en een kort
+      "ok"-geluid bij herstel. Eén keer per wijziging, zonder herhaling. Aan/uit zet je met de 🔔-knop in de tv-modus (per browser).</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button type="button" class="btn ghost small" data-sound="crit">▶ Kritiek</button>
+      <button type="button" class="btn ghost small" data-sound="warn">▶ Waarschuwing</button>
+      <button type="button" class="btn ghost small" data-sound="ok">▶ Hersteld</button>
+    </div>`;
+  el.querySelectorAll('[data-sound]').forEach((b) => { b.onclick = () => playSound(b.dataset.sound); });
   $('#gForm').onsubmit = async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
