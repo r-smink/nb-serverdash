@@ -879,7 +879,33 @@ function renderTv() {
     const [ns, db, vps] = SERVER_GROUPS;
     $('#tvGrid').innerHTML = group(vps, tile, 'tv-grid');
     $('#tvSide').innerHTML = group(ns, small, 'tv-small-list') + group(db, small, 'tv-small-list');
+    fit();
   }
+
+  // Alles moet altijd in beeld blijven: hoe meer problemen, hoe kleiner de groene blokjes. Eerst kleiner,
+  // dan compacte regeltjes (naam + CPU), en pas daarna worden ook de probleemkaarten kleiner.
+  // [groene blokjes, probleemkaarten, compact, notities op kaarten inkorten]
+  const STEPS = [[1, 1], [0.85, 1], [0.72, 1], [0.6, 1], [1, 1, true], [0.85, 1, true], [0.85, 0.85, true],
+    [0.85, 0.72, true, true], [0.75, 0.6, true, true], [0.65, 0.5, true, true]];
+  function fit() {
+    const wrap = $('.tv-wrap'), side = $('#tvSide');
+    if (!wrap) return;
+    const fits = () => document.documentElement.scrollHeight <= window.innerHeight + 1;
+    // De kolom rechts krimpt alleen als die zelf niet past.
+    for (const ss of [1, 0.85, 0.72, 0.6]) {
+      wrap.style.setProperty('--ss', ss);
+      if (side.getBoundingClientRect().bottom + window.scrollY <= window.innerHeight - 22) break;
+    }
+    for (const [sz, prob, compact, tight] of STEPS) {
+      wrap.style.setProperty('--s', sz);
+      wrap.style.setProperty('--p', prob);
+      wrap.classList.toggle('compact', !!compact);
+      wrap.classList.toggle('tight', !!tight);
+      if (fits()) break;
+    }
+  }
+  window.addEventListener('resize', fit);
+  view.cleanup.push(() => window.removeEventListener('resize', fit));
 
   load();
   view.timers.push(setInterval(load, 15_000));
