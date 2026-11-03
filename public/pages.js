@@ -1,6 +1,6 @@
 'use strict';
 /* global $, $$, esc, api, fmt, main, view, prefs, savePrefs, setConn, dialog, lvlFor, TYPES, LEVEL_LABEL, LEVEL_RANK, C,
-   drawChartSet, observeCharts, sparkSvg, me, isAdmin, boot, updateIncidentBadge */
+   drawChartSet, observeCharts, sparkSvg, me, isAdmin, boot, updateIncidentBadge, SERVER_GROUPS, groupOf, isProblem */
 
 // ---------- gedeelde stukjes ----------
 
@@ -761,7 +761,7 @@ function renderTv() {
         <a href="#/" class="btn ghost small" title="Sluiten (Esc)">✕</a>
       </div>
       <div id="tvProblems"></div>
-      <div class="tv-grid" id="tvGrid"></div>
+      <div class="tv-groups" id="tvGrid"></div>
     </div>`;
   const clock = () => { const el = $('#tvClock'); if (el) el.textContent = new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }); };
   clock();
@@ -845,7 +845,8 @@ function renderTv() {
         </a>`).join('')}
       </div>` : '<div class="tv-allgood">✓ Alles in orde</div>';
 
-    $('#tvGrid').innerHTML = [...servers].sort(byName).map((s) => {
+    // Servers met een probleem staan al bovenaan als grote kaart; de rest per groep (NS / DB / VPS).
+    const tile = (s) => {
       const m = s.summary;
       return `<a class="tv-mini-tile lvl-${s.status.level}" href="#/server/${s.id}">
         <div class="tv-mini-name"><span class="dot"></span>${esc(s.name)}</div>
@@ -856,6 +857,12 @@ function renderTv() {
           <span title="Disk"><i style="width:${Math.min(100, m.disk?.pct || 0)}%" class="${lvlFor(m.disk?.pct, (s.thresholds || d.thresholds).disk)}"></i></span>
         </div><div class="tv-mini-val">${fmt.pct(m.cpu)} CPU</div>` : `<div class="tv-mini-val">${s.status.offline ? 'offline' : '–'}</div>`}
       </a>`;
+    };
+    const rest = servers.filter((s) => !isProblem(s));
+    $('#tvGrid').innerHTML = SERVER_GROUPS.map((g) => {
+      const items = rest.filter((s) => groupOf(s) === g).sort(byName);
+      return items.length ? `<div class="tv-group-head">${g[0]}<span class="count">${items.length}</span></div>
+        <div class="tv-grid">${items.map(tile).join('')}</div>` : '';
     }).join('');
   }
 

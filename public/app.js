@@ -223,7 +223,7 @@ function drawOverview() {
     .sort((a, b) => LEVEL_RANK[b.status.level] - LEVEL_RANK[a.status.level] || a.name.localeCompare(b.name, 'nl', { numeric: true }));
 
   $('#grid').innerHTML = list.length
-    ? tileGroups(list, (s) => tileHtml(s, d))
+    ? serverGroups(list, (s) => tileHtml(s, d))
     : `<div class="empty">${d.servers.length ? 'Geen servers die aan het filter voldoen.' : 'Nog geen servers. <a href="#/beheer">Voeg je eerste server toe</a>.'}</div>`;
 
   $('#events').innerHTML = eventsHtml(d.events, true) || '<li class="muted">Nog geen meldingen</li>';
@@ -237,6 +237,24 @@ function tileGroups(list, render) {
   const rest = list.filter((x) => x.status.level !== 'crit').sort((a, b) => order[a.status.level] - order[b.status.level]);
   return (crit.length ? `<div class="grid grid-crit">${crit.map(render).join('')}</div>` : '')
     + (rest.length ? `<div class="grid grid-rest">${rest.map(render).join('')}</div>` : '');
+}
+
+// Servers verdeeld per soort; Plesk en overig vallen samen onder VPS.
+const SERVER_GROUPS = [['Nameservers', ['nameserver']], ['Databases', ['database']], ['VPS', ['plesk', 'other']]];
+const groupOf = (s) => SERVER_GROUPS.find(([, types]) => types.includes(s.type)) || SERVER_GROUPS[2];
+const isProblem = (s) => s.status.level === 'crit' || s.status.level === 'warn';
+
+/** Overzicht: servers met een probleem springen bovenaan, de rest staat per groep (NS / DB / VPS). */
+function serverGroups(list, render) {
+  const problems = list.filter(isProblem);
+  const order = { ok: 0, pending: 1, muted: 2 };
+  const rest = list.filter((s) => !isProblem(s));
+  return (problems.length ? tileGroups(problems, render) : '')
+    + SERVER_GROUPS.map((g) => {
+      const items = rest.filter((s) => groupOf(s) === g).sort((a, b) => order[a.status.level] - order[b.status.level] || byName(a, b));
+      return items.length ? `<div class="group-head">${g[0]}<span class="count">${items.length}</span></div>
+        <div class="grid grid-rest">${items.map(render).join('')}</div>` : '';
+    }).join('');
 }
 
 function meter(label, value, text, lvl) {
