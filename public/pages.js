@@ -760,8 +760,10 @@ function renderTv() {
         <button type="button" class="btn ghost small" id="tvSound"></button>
         <a href="#/" class="btn ghost small" title="Sluiten (Esc)">✕</a>
       </div>
-      <div id="tvProblems"></div>
-      <div class="tv-groups" id="tvGrid"></div>
+      <div class="tv-body">
+        <div class="tv-main"><div id="tvProblems"></div><div class="tv-groups" id="tvGrid"></div></div>
+        <aside class="tv-side" id="tvSide"></aside>
+      </div>
     </div>`;
   const clock = () => { const el = $('#tvClock'); if (el) el.textContent = new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }); };
   clock();
@@ -858,12 +860,25 @@ function renderTv() {
         </div><div class="tv-mini-val">${fmt.pct(m.cpu)} CPU</div>` : `<div class="tv-mini-val">${s.status.offline ? 'offline' : '–'}</div>`}
       </a>`;
     };
+    // Nameservers en databases klein in de kolom rechts onder de klok: één regel per server.
+    const small = (s) => {
+      const m = s.summary, th = s.thresholds || d.thresholds;
+      const val = (label, v, t) => `<span class="${lvlFor(v, t)}">${label} ${fmt.pct(v)}</span>`;
+      return `<a class="tv-small lvl-${s.status.level}" href="#/server/${s.id}" title="${esc(s.notes || '')}">
+        <span class="tv-small-name"><span class="dot"></span>${esc(s.name)}</span>
+        <span class="tv-small-val">${m && !s.status.offline ? `${val('CPU', m.cpu, th.cpu)}${val('RAM', m.mem_pct, th.mem)}${val('Disk', m.disk?.pct, th.disk)}`
+          : s.status.offline ? 'offline' : '–'}</span>
+      </a>`;
+    };
     const rest = servers.filter((s) => !isProblem(s));
-    $('#tvGrid').innerHTML = SERVER_GROUPS.map((g) => {
+    const group = (g, render, cls) => {
       const items = rest.filter((s) => groupOf(s) === g).sort(byName);
       return items.length ? `<div class="tv-group-head">${g[0]}<span class="count">${items.length}</span></div>
-        <div class="tv-grid">${items.map(tile).join('')}</div>` : '';
-    }).join('');
+        <div class="${cls}">${items.map(render).join('')}</div>` : '';
+    };
+    const [ns, db, vps] = SERVER_GROUPS;
+    $('#tvGrid').innerHTML = group(vps, tile, 'tv-grid');
+    $('#tvSide').innerHTML = group(ns, small, 'tv-small-list') + group(db, small, 'tv-small-list');
   }
 
   load();
