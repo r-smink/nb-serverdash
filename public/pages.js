@@ -878,7 +878,14 @@ function renderTv() {
     };
     const [ns, db, vps] = SERVER_GROUPS;
     $('#tvGrid').innerHTML = group(vps, tile, 'tv-grid');
-    $('#tvSide').innerHTML = group(ns, small, 'tv-small-list') + group(db, small, 'tv-small-list');
+    // Websites zonder probleem klein bovenaan in de kolom rechts (problemen staan al als kaart bovenaan).
+    const sites = d.websites.filter((w) => !isProblem(w)).sort((a, b) => a.domain.localeCompare(b.domain, 'nl'));
+    const site = (w) => `<a class="tv-site lvl-${w.status.level}" href="#/website/${w.id}" title="${esc(w.domain)}${w.check?.ms != null ? ` · ${Math.round(w.check.ms)} ms` : ''}">
+      <span class="dot"></span><span class="tv-site-name">${esc(w.domain)}</span></a>`;
+    $('#tvSide').innerHTML = (sites.length ? `<div class="tv-group-head">Websites<span class="count">${sites.length}</span></div>
+        <div class="tv-site-list" id="tvSites">${sites.map(site).join('')}</div>
+        <div class="tv-sites-ok hidden" id="tvSitesOk">✓ ${sites.length} website${sites.length === 1 ? '' : 's'} in orde</div>` : '')
+      + group(ns, small, 'tv-small-list') + group(db, small, 'tv-small-list');
     fit();
   }
 
@@ -892,9 +899,16 @@ function renderTv() {
     if (!wrap) return;
     const fits = () => document.documentElement.scrollHeight <= window.innerHeight + 1;
     // De kolom rechts krimpt alleen als die zelf niet past.
-    for (const ss of [1, 0.85, 0.72, 0.6]) {
-      wrap.style.setProperty('--ss', ss);
-      if (side.getBoundingClientRect().bottom + window.scrollY <= window.innerHeight - 22) break;
+    // Te veel websites om klein te tonen: dan alleen het aantal dat in orde is.
+    const sideFits = () => side.getBoundingClientRect().bottom + window.scrollY <= window.innerHeight - 22;
+    for (const collapse of [false, true]) {
+      $('#tvSites')?.classList.toggle('hidden', collapse);
+      $('#tvSitesOk')?.classList.toggle('hidden', !collapse);
+      for (const ss of [1, 0.85, 0.72, 0.6, 0.5]) {
+        wrap.style.setProperty('--ss', ss);
+        if (sideFits()) break;
+      }
+      if (sideFits()) break;
     }
     for (const [sz, prob, compact, tight] of STEPS) {
       wrap.style.setProperty('--s', sz);

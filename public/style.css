@@ -472,6 +472,15 @@ body.tv main { max-width: none; padding: 22px 28px; }
 .tv-side { display: grid; gap: 10px; align-content: start; }
 .tv-side .tv-group-head { font-size: calc(14px * var(--ss, 1)); margin-top: 0; }
 .tv-side .tv-group-head ~ .tv-group-head { margin-top: 10px; }
+.tv-site-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(150px * var(--ss, 1)), 1fr)); gap: calc(5px * var(--ss, 1)); }
+.tv-site {
+  display: flex; align-items: center; gap: 6px; min-width: 0; padding: calc(5px * var(--ss, 1)) 8px; color: var(--ok);
+  background: var(--surface-card); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm, 8px);
+}
+.tv-site.lvl-muted, .tv-site.lvl-pending { opacity: .5; color: var(--pending); }
+.tv-site .dot { width: 7px; height: 7px; flex: none; }
+.tv-site-name { font-size: calc(12px * var(--ss, 1)); color: var(--text-default); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tv-sites-ok { padding: 8px 12px; border-radius: var(--radius-md); background: var(--surface-card); border: 1px solid var(--border-subtle); color: var(--ok); font-weight: 700; font-size: var(--text-sm); }
 .tv-small-list { display: grid; gap: calc(6px * var(--ss, 1)); }
 .tv-small {
   display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: calc(8px * var(--ss, 1)) 12px;
