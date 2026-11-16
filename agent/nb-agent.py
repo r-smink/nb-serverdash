@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 CONF_FILE = os.environ.get('NB_AGENT_CONF', '/etc/nb-agent.conf')
 HZ = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
@@ -918,6 +918,14 @@ class SlowTasks(object):
 
         # Plesk: metadata van server- en abonnementsback-ups in /var/lib/psa/dumps
         dumps = '/var/lib/psa/dumps'
+        try:   # Plesk kan een andere dumpmap gebruiken (DUMP_D in psa.conf)
+            with open('/etc/psa/psa.conf') as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == 'DUMP_D' and os.path.isdir(parts[1]):
+                        dumps = parts[1]
+        except (IOError, OSError):
+            pass
         if os.path.isdir(dumps):
             result['source'] = 'plesk'
             infos = glob.glob(os.path.join(dumps, 'backup_info_*.xml')) + \
@@ -956,12 +964,16 @@ class SlowTasks(object):
                     break
             if status:
                 ts = int(os.path.getmtime(sess))
+                status = 'error' if status == 'error' else 'warnings' if status == 'warnings' else 'success'
                 if candidates and abs(candidates[0][0] - ts) < 6 * 3600:
-                    candidates[0][2] = 'error' if status == 'error' else 'warnings' if status == 'warnings' else 'success'
+                    candidates[0][2] = status
                     candidates[0][0] = max(candidates[0][0], ts) if status != 'error' else candidates[0][0]
-                elif not candidates:
-                    candidates.append([ts, None, 'error' if status == 'error' else 'warnings' if status == 'warnings' else 'success',
-                                       os.path.basename(sess), 'plesk'])
+                elif not candidates or (ts > candidates[0][0] and status != 'error'):
+                    # Geen lokale dump bij deze sessie (bijv. back-up alleen naar FTP/S3): de geslaagde
+                    # sessie telt dan, anders blijft een oude lokale dump als 'laatste back-up' staan.
+                    candidates[:1] = [[ts, None, status, os.path.basename(sess), 'plesk']]
+                elif ts > candidates[0][0]:
+                    candidates[0][2] = 'error'   # nieuwste poging mislukt; tijd van laatste goede blijft
                 break
 
         # Eigen back-upmappen uit de configuratie (bijv. mariabackup op de databaseserver)
