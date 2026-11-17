@@ -7,6 +7,7 @@ import * as mon from './monitor.js';
 import { DEFAULT_THRESHOLDS, mergeThresholds, cleanOverrides } from './status.js';
 import { maskedNotifyConfig, saveNotifyConfig, notify, getRules, saveRules, testRule, rulesFor } from './alerts.js';
 import { diskForecast, wordpressOverview, refreshWporg, cmpVersion } from './insights.js';
+import * as mailhooks from './mailhooks.js';
 
 const { nowSec } = store;
 const SERVER_TYPES = ['plesk', 'nameserver', 'database', 'other'];
@@ -32,7 +33,7 @@ function on(method, pattern, handler, opts = {}) {
   });
 }
 
-const clientIp = (req) => (config.trustProxy && req.headers['x-forwarded-for']?.split(',')[0].trim()) || req.socket.remoteAddress;
+export const clientIp = (req) => (config.trustProxy && req.headers['x-forwarded-for']?.split(',')[0].trim()) || req.socket.remoteAddress;
 const isHttps = (req) => config.secureCookie || (config.trustProxy && req.headers['x-forwarded-proto'] === 'https');
 
 function baseUrl(req) {
@@ -190,6 +191,7 @@ on('GET', '/api/overview', () => {
     servers: store.listServers().map((s) => mon.serverSummary(s, th, now)),
     events: store.recentEvents(25),
     openIncidents: store.openIncidents().length,
+    mailAlerts: mailhooks.activeAlerts(now),
   };
 });
 
@@ -205,6 +207,7 @@ on('GET', '/api/tv', () => {
     websites: store.listWebsites().map((w) => mon.siteSummary(w, byId, th, now))
       .map(({ id, domain, server, status, check, stats }) => ({ id, domain, server, status, check, rpm: stats?.rpm })),
     incidents: store.openIncidents().length,
+    mailAlerts: mailhooks.activeAlerts(now),
   };
 });
 
@@ -635,6 +638,8 @@ on('GET', '/api/settings', () => ({
   autoSites: store.getSetting('autoSites', { enabled: false, check: true }),
   heartbeatUrl: store.getSetting('heartbeatUrl', ''),
   publicUrl: config.publicUrl,
+  mailAlertMinutes: mailhooks.displayMinutes(),
+  mailAlertDurations: mailhooks.DURATIONS,
 }), { role: 'admin' });
 
 on('PUT', '/api/settings', ({ body }) => {
@@ -651,6 +656,10 @@ on('PUT', '/api/settings', ({ body }) => {
     const url = String(body.heartbeatUrl || '').trim();
     if (url && !/^https?:\/\//i.test(url)) throw new HttpError(400, 'Heartbeat-URL moet met http(s):// beginnen');
     store.setSetting('heartbeatUrl', url);
+  }
+  if (body.mailAlertMinutes !== undefined) {
+    if (!mailhooks.DURATIONS.includes(+body.mailAlertMinutes)) throw new HttpError(400, 'Ongeldige weergaveduur');
+    store.setSetting('mailAlertMinutes', +body.mailAlertMinutes);
   }
   return { ok: true };
 });
@@ -677,6 +686,38 @@ on('POST', '/api/settings/test-rule', async ({ body }) => {
   const failed = results.filter((r) => !r.ok);
   if (failed.length) throw new HttpError(400, `Mislukt: ${failed.map((r) => `${r.channel}: ${r.error}`).join('; ')}`);
   return { ok: true, sent: results.map((r) => r.channel) };
+});
+
+// ---------- e-mailmeldingen (webhook) ----------
+
+/** Tokens voor /hooks/mail/<token>; het token zelf wordt alleen bij het aanmaken getoond. */
+on('GET', '/api/mail-hooks', ({ req }) => ({
+  tokens: store.listHookTokens(),
+  hookBase: `${baseUrl(req)}/hooks/mail/`,
+  minutes: mailhooks.displayMinutes(),
+  durations: mailhooks.DURATIONS,
+}), { role: 'admin' });
+
+on('POST', '/api/mail-hooks', ({ req, body }) => {
+  const name = String(body.name || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  if (!name) throw new HttpError(400, 'Geef het token een naam, bijv. "OC Monitor-paneel"');
+  const { id, token } = store.createHookToken(name);
+  return { id, name, url: `${baseUrl(req)}/hooks/mail/${token}` };
+});
+
+on('DELETE', '/api/mail-hooks/:id', ({ params }) => {
+  if (!store.deleteHookToken(+params.id)) throw new HttpError(404, 'Token niet gevonden');
+  return { ok: true };
+});
+
+on('POST', '/api/mail-alerts/test', () => {
+  mailhooks.recordTest(config.publicUrl);
+  return { ok: true };
+});
+
+on('POST', '/api/mail-alerts/:id/dismiss', ({ params }) => {
+  if (!store.dismissMailAlert(+params.id, nowSec())) throw new HttpError(404, 'Melding niet gevonden');
+  return { ok: true };
 });
 
 // ---------- achtergrondtaken ----------

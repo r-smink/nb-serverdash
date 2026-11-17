@@ -761,7 +761,7 @@ function renderTv() {
         <a href="#/" class="btn ghost small" title="Sluiten (Esc)">✕</a>
       </div>
       <div class="tv-body">
-        <div class="tv-main"><div id="tvProblems"></div><div class="tv-groups" id="tvGrid"></div></div>
+        <div class="tv-main"><div id="tvMail"></div><div id="tvProblems"></div><div class="tv-groups" id="tvGrid"></div></div>
         <aside class="tv-side" id="tvSide"></aside>
       </div>
     </div>`;
@@ -826,13 +826,19 @@ function renderTv() {
       .sort((a, b) => LVL_ORDER(a.status.level, b.status.level));
     const crit = probS.filter((s) => s.status.level === 'crit').length + probW.filter((w) => w.status.level === 'crit').length;
     const warn = probS.length + probW.length - crit;
+    const mail = d.mailAlerts || [];
+    const mailFailed = mail.filter((a) => a.level === 'crit').length;
     $('#tvSummary').innerHTML = `
       <span class="chip">${servers.length} servers · ${d.websites.length} websites</span>
       <span class="chip crit ${crit ? 'has' : ''}">${crit} kritiek</span>
       <span class="chip warn ${warn ? 'has' : ''}">${warn} waarschuwing</span>
-      ${d.incidents ? `<span class="chip">${d.incidents} open incident${d.incidents === 1 ? '' : 'en'}</span>` : ''}`;
+      ${d.incidents ? `<span class="chip">${d.incidents} open incident${d.incidents === 1 ? '' : 'en'}</span>` : ''}
+      ${mailFailed ? `<span class="chip crit has">✉ ${mailFailed} e-mail niet verstuurd</span>` : ''}`;
     document.title = crit ? `(${crit}) ServerDash TV` : 'ServerDash TV';
 
+    // E-mailmeldingen boven de probleemkaarten; zonder meldingen blijft #tvMail leeg (en neemt geen ruimte in).
+    $('#tvMail').innerHTML = mailAlertsHtml(mail, d.now, { tv: true });
+    const mailProblems = mail.some((a) => a.level === 'crit' || a.level === 'warn');
     $('#tvProblems').innerHTML = probS.length || probW.length ? `
       <div class="tv-problems">
         ${probS.map((s) => `<a class="tv-card lvl-${s.status.level}" href="#/server/${s.id}">
@@ -845,7 +851,7 @@ function renderTv() {
           <div class="tv-card-head"><span class="dot"></span>${esc(w.domain)}<span class="badge">${esc(w.server?.name || '')}</span></div>
           <ul class="issues">${w.status.issues.filter((i) => i.level === 'crit' || i.level === 'warn').slice(0, 3).map((i) => `<li class="${i.level}">${esc(i.msg)}</li>`).join('')}</ul>
         </a>`).join('')}
-      </div>` : '<div class="tv-allgood">✓ Alles in orde</div>';
+      </div>` : mailProblems ? '' : '<div class="tv-allgood">✓ Alles in orde</div>';
 
     // Servers met een probleem staan al bovenaan als grote kaart; de rest per groep (NS / DB / VPS).
     const tile = (s) => {
@@ -1321,6 +1327,86 @@ function drawGeneralSettings(el, s) {
       $('#gMsg').textContent = 'Opgeslagen ✓';
     } catch (ex) { $('#gMsg').style.color = ''; $('#gMsg').textContent = ex.message; }
   };
+}
+
+// ---------- e-mailmeldingen (webhook) ----------
+
+const DURATION_LABEL = (m) => (m >= 1440 ? `${m / 1440} dag` : m >= 60 ? `${m / 60} uur` : `${m} minuten`);
+
+async function drawMailHookSettings(el) {
+  const d = await api('/mail-hooks');
+  el.innerHTML = `
+    <div class="panel-head"><h3>E-mailmeldingen (webhook)</h3>
+      <div class="right"><button type="button" class="btn ghost small" id="mhTest">Testmelding tonen</button></div></div>
+    <p class="note">WordPress-sites met NB OC Monitor melden via deze webhook e-mail die niet verstuurd kon worden (direct of via het
+      OC Monitor-paneel). Zo'n melding staat op het overzicht en in de tv-modus en verdwijnt na de ingestelde tijd, of direct
+      zodra de site meldt dat versturen weer lukt. Er worden geen incidenten of meldingen aangemaakt.</p>
+    <table><thead><tr><th>Naam</th><th>Aangemaakt</th><th>Laatst gebruikt</th><th></th></tr></thead>
+      <tbody>${d.tokens.map((t) => `<tr>
+        <td><b>${esc(t.name)}</b></td>
+        <td>${fmt.time(t.created_at)}</td>
+        <td>${t.last_used_at ? fmt.ago(t.last_used_at) : '<span class="muted">nooit</span>'}</td>
+        <td class="actions"><button class="btn danger small" data-revoke="${t.id}">Intrekken</button></td>
+      </tr>`).join('') || '<tr><td colspan="4" class="muted">Nog geen tokens. Maak er een aan voor het OC Monitor-paneel of per site.</td></tr>'}</tbody></table>
+    <form class="form" id="mhForm" style="margin-top:14px">
+      <div class="row">
+        <label>Nieuw token, naam<input name="name" maxlength="100" placeholder="bijv. OC Monitor-paneel of klant.nl" autocomplete="off"></label>
+        <div style="align-self:end"><button class="btn">+ Token aanmaken</button></div>
+      </div>
+      <div class="row">
+        <label>Melding tonen gedurende<select name="minutes">${d.durations.map((m) => `<option value="${m}" ${m === d.minutes ? 'selected' : ''}>${DURATION_LABEL(m)}</option>`).join('')}</select></label>
+        <p class="note" style="align-self:end">Een nieuwe melding van dezelfde site begint de tijd opnieuw. "Hersteld" staat altijd 5 minuten in beeld.</p>
+      </div>
+      <div class="form-error" id="mhMsg"></div>
+    </form>`;
+  const reload = () => drawMailHookSettings(el);
+  const msg = (text, ok) => { $('#mhMsg').style.color = ok ? 'var(--success-500)' : ''; $('#mhMsg').textContent = text; };
+  const form = $('#mhForm');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api('/mail-hooks', { method: 'POST', body: { name: new FormData(form).get('name') } });
+      showHookUrl(r);
+      reload();
+    } catch (ex) { msg(ex.message); }
+  };
+  form.minutes.onchange = async () => {
+    try { await api('/settings', { method: 'PUT', body: { mailAlertMinutes: +form.minutes.value } }); msg('Opgeslagen ✓', true); } catch (ex) { msg(ex.message); }
+  };
+  $('#mhTest').onclick = async () => {
+    try { await api('/mail-alerts/test', { method: 'POST', body: {} }); msg('Testmelding staat op het overzicht en in de tv-modus ✓', true); } catch (ex) { msg(ex.message); }
+  };
+  el.onclick = async (e) => {
+    const b = e.target.closest('button[data-revoke]');
+    if (!b) return;
+    const t = d.tokens.find((x) => x.id === +b.dataset.revoke);
+    if (!confirm(`Token "${t.name}" intrekken? Sites of het paneel met deze URL kunnen dan geen meldingen meer sturen.`)) return;
+    try { await api(`/mail-hooks/${t.id}`, { method: 'DELETE' }); reload(); } catch (ex) { alert(ex.message); }
+  };
+}
+
+function showHookUrl(r) {
+  const d = dialog(`
+    <div class="form">
+      <h3>Webhook-URL voor ${esc(r.name)}</h3>
+      <p class="note">Deze URL bevat het token en wordt maar één keer getoond. Kwijt? Trek het token in en maak een nieuw aan.</p>
+      <div class="cmd-box"><pre>${esc(r.url)}</pre></div>
+      <p class="note">
+        Plak de URL in het <b>OC Monitor-paneel</b> → Instellingen → Meldingen → ServerDash, of rechtstreeks op een site in
+        <b>NB OC Monitor</b> → SMTP → Meldingen → webhook. Stuur daarna een testmelding vanuit de plugin: die verschijnt hier op
+        het overzicht.<br>
+        Ook mogelijk: <code>POST /hooks/mail</code> met de header <code>Authorization: Bearer &lt;token&gt;</code>.
+      </p>
+      <div class="actions">
+        <button class="btn ghost" id="copy">Kopiëren</button>
+        <button class="btn" id="done">Klaar</button>
+      </div>
+    </div>`);
+  $('#copy', d).onclick = async () => {
+    await navigator.clipboard.writeText(r.url).catch(() => {});
+    $('#copy', d).textContent = 'Gekopieerd ✓';
+  };
+  $('#done', d).onclick = () => d.close();
 }
 
 async function drawUsersAdmin(el) {

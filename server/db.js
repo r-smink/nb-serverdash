@@ -174,6 +174,39 @@ CREATE TABLE IF NOT EXISTS security_hourly (
   f2b_banned INTEGER NOT NULL DEFAULT 0,  -- max. tegelijk geblokkeerd in dat uur
   PRIMARY KEY (server_id, hour)
 ) WITHOUT ROWID;
+
+-- Tokens voor de webhook /hooks/mail/<token> (alleen de sha256-hash wordt bewaard).
+CREATE TABLE IF NOT EXISTS hook_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER
+);
+
+-- Meldingen van WordPress-sites over e-mail die niet verstuurd kon worden (alleen weergave, geen incidenten).
+CREATE TABLE IF NOT EXISTS mail_alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_id INTEGER,
+  site_host TEXT NOT NULL DEFAULT '',
+  site_title TEXT NOT NULL DEFAULT '',
+  site_url TEXT NOT NULL DEFAULT '',
+  event TEXT NOT NULL,               -- 'smtp.failed' | 'smtp.backup_used' | 'smtp.recovered' | 'smtp.test'
+  level TEXT NOT NULL,               -- 'crit' | 'warn' | 'ok' | 'info'
+  subject TEXT NOT NULL DEFAULT '',
+  recipient TEXT NOT NULL DEFAULT '', -- al gemaskeerd, bijv. j***@klant.nl
+  error TEXT NOT NULL DEFAULT '',
+  diagnose_title TEXT NOT NULL DEFAULT '',
+  initiator TEXT NOT NULL DEFAULT '',
+  maillog_url TEXT NOT NULL DEFAULT '',
+  count INTEGER NOT NULL DEFAULT 1,
+  first_at INTEGER NOT NULL,
+  last_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  dismissed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS mail_alerts_active ON mail_alerts (expires_at, dismissed_at);
+CREATE INDEX IF NOT EXISTS mail_alerts_site ON mail_alerts (site_host, event);
 `);
 
 /** Kolom toevoegen aan een bestaande tabel (migratie), stil als hij al bestaat. */
@@ -582,6 +615,44 @@ export const addIncidentNote = (id, user, text) =>
 export const eventsBetween = (serverId, from, to) =>
   db.prepare('SELECT id, ts, level, message FROM events WHERE server_id = ? AND ts >= ? AND ts <= ? ORDER BY ts').all(serverId, from, to);
 
+// ---------- e-mailmeldingen (webhook) ----------
+
+export const listHookTokens = () => db.prepare('SELECT id, name, created_at, last_used_at FROM hook_tokens ORDER BY created_at DESC, id DESC').all();
+/** Alle hashes, voor een constant-time vergelijking in de webhook (er zijn er maar een paar). */
+export const hookTokenHashes = () => db.prepare('SELECT id, token_hash FROM hook_tokens').all();
+export function createHookToken(name) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const { lastInsertRowid } = db.prepare('INSERT INTO hook_tokens (name, token_hash, created_at) VALUES (?, ?, ?)')
+    .run(name, hashToken(token), nowSec());
+  return { id: Number(lastInsertRowid), token };
+}
+export const deleteHookToken = (id) => db.prepare('DELETE FROM hook_tokens WHERE id = ?').run(id).changes;
+export const touchHookToken = (id, ts) => db.prepare('UPDATE hook_tokens SET last_used_at = ? WHERE id = ?').run(ts, id);
+
+const MAIL_COLS = 'id, token_id, site_host, site_title, site_url, event, level, subject, recipient, error, diagnose_title, initiator, maillog_url, count, first_at, last_at, expires_at, dismissed_at';
+/** Actieve melding voor dezelfde site + soort. Zonder host (geen geldige site_url) telt de titel als sleutel. */
+export const activeMailAlert = (host, title, event, now) => db.prepare(`SELECT ${MAIL_COLS} FROM mail_alerts
+  WHERE site_host = ? AND (site_host != '' OR site_title = ?) AND event = ? AND expires_at > ? AND dismissed_at IS NULL
+  ORDER BY id DESC LIMIT 1`).get(host, title, event, now);
+export const activeMailAlerts = (now) => db.prepare(`SELECT ${MAIL_COLS} FROM mail_alerts
+  WHERE expires_at > ? AND dismissed_at IS NULL ORDER BY last_at DESC, id DESC LIMIT 100`).all(now);
+export function insertMailAlert(a) {
+  db.prepare(`INSERT INTO mail_alerts (token_id, site_host, site_title, site_url, event, level, subject, recipient, error,
+    diagnose_title, initiator, maillog_url, count, first_at, last_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(a.token_id ?? null, a.site_host, a.site_title, a.site_url, a.event, a.level, a.subject, a.recipient, a.error,
+      a.diagnose_title, a.initiator, a.maillog_url, a.count, a.first_at, a.last_at, a.expires_at);
+}
+export function updateMailAlert(id, a) {
+  db.prepare(`UPDATE mail_alerts SET site_title = ?, site_url = ?, subject = ?, recipient = ?, error = ?, diagnose_title = ?,
+    initiator = ?, maillog_url = ?, count = count + ?, last_at = ?, expires_at = ? WHERE id = ?`)
+    .run(a.site_title, a.site_url, a.subject, a.recipient, a.error, a.diagnose_title, a.initiator, a.maillog_url, a.count, a.last_at, a.expires_at, id);
+}
+/** Herstel: actieve meldingen van deze soorten voor de site direct laten verlopen. */
+export const expireMailAlerts = (host, title, events, now) => db.prepare(`UPDATE mail_alerts SET expires_at = ?
+  WHERE site_host = ? AND (site_host != '' OR site_title = ?) AND event IN (${events.map(() => '?').join(', ')})
+  AND expires_at > ? AND dismissed_at IS NULL`).run(now, host, title, ...events, now).changes;
+export const dismissMailAlert = (id, now) => db.prepare('UPDATE mail_alerts SET dismissed_at = ? WHERE id = ? AND dismissed_at IS NULL').run(now, id).changes;
+
 // ---------- bereikbaarheid (TCP) ----------
 
 export const insertServerCheck = (id, ts, ok, ms) =>
@@ -741,4 +812,6 @@ export function purge() {
   db.prepare('DELETE FROM security_hourly WHERE hour < ?').run(now - 90 * 86400);
   db.prepare('DELETE FROM incident_notes WHERE incident_id IN (SELECT id FROM incidents WHERE ended IS NOT NULL AND ended < ?)').run(metricsBefore);
   db.prepare('DELETE FROM incidents WHERE ended IS NOT NULL AND ended < ?').run(metricsBefore);
+  // E-mailmeldingen zijn alleen voor weergave; verlopen meldingen een week bewaren.
+  db.prepare('DELETE FROM mail_alerts WHERE expires_at < ?').run(now - 7 * 86400);
 }

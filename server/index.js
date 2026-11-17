@@ -5,7 +5,8 @@ import { config } from './config.js';
 import * as store from './db.js';
 import * as auth from './auth.js';
 import * as mon from './monitor.js';
-import { routes, HttpError, refreshWordpressVersions } from './api.js';
+import { routes, HttpError, refreshWordpressVersions, clientIp } from './api.js';
+import { isHookPath, handleMailHook } from './mailhooks.js';
 
 auth.bootstrapUsers();
 
@@ -79,6 +80,8 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; frame-ancestors 'none'");
   try {
     const url = new URL(req.url, 'http://localhost');
+    // Webhook voor e-mailmeldingen: geen sessie of CSRF, het token is de authenticatie (alleen deze route).
+    if (isHookPath(url.pathname)) return handleMailHook(req, res, url.pathname, clientIp(req));
     if (!url.pathname.startsWith('/api/')) return serveStatic(req, res, url.pathname);
 
     for (const r of routes) {

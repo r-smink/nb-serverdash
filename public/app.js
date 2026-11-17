@@ -172,6 +172,7 @@ function renderOverview() {
         </div>
       </div>
     </div>
+    <div id="mailAlerts"></div>
     <div class="tile-groups" id="grid"><div class="empty">Laden…</div></div>
     <section class="panel"><div class="panel-head"><h3>Recente meldingen</h3><a class="right" href="#/meldingen">Alle meldingen →</a></div><ul class="events" id="events"></ul></section>`;
 
@@ -183,6 +184,16 @@ function renderOverview() {
     savePrefs();
     $$('#typeFilter button').forEach((x) => x.classList.toggle('on', x === b));
     drawOverview();
+  };
+  $('#mailAlerts').onclick = async (e) => {
+    const b = e.target.closest('button[data-dismiss]');
+    if (!b) return;
+    b.disabled = true;
+    try {
+      await api(`/mail-alerts/${b.dataset.dismiss}/dismiss`, { method: 'POST', body: {} });
+      if (overviewData) overviewData.mailAlerts = overviewData.mailAlerts.filter((a) => a.id !== +b.dataset.dismiss);
+      drawOverview();
+    } catch (ex) { b.disabled = false; alert(ex.message); }
   };
   if (overviewData) drawOverview();
   loadOverview(nav);
@@ -226,6 +237,7 @@ function drawOverview() {
     ? serverGroups(list, (s) => tileHtml(s, d))
     : `<div class="empty">${d.servers.length ? 'Geen servers die aan het filter voldoen.' : 'Nog geen servers. <a href="#/beheer">Voeg je eerste server toe</a>.'}</div>`;
 
+  $('#mailAlerts').innerHTML = mailAlertsHtml(d.mailAlerts, d.now);
   $('#events').innerHTML = eventsHtml(d.events, true) || '<li class="muted">Nog geen meldingen</li>';
   document.title = counts.crit ? `(${counts.crit}) ServerDash` : 'ServerDash';
 }
@@ -313,6 +325,56 @@ function tileHtml(s, d) {
       ${showIssues ? `<ul class="issues">${issues.slice(0, big ? 6 : 2).map((i) => `<li class="${i.level}">${esc(i.msg)}</li>`).join('')}</ul>` : ''}
       ${body}
     </a>`;
+}
+
+// ---------- e-mailmeldingen (webhook van de WordPress SMTP-logger) ----------
+
+const MAIL_LABEL = { crit: 'Niet verstuurd', warn: 'Via backupverbinding', ok: 'Hersteld', info: 'Test' };
+const MAIL_TEXT = { warn: 'Verstuurd via backupverbinding', ok: 'E-mail wordt weer verstuurd', info: 'Testmelding — de koppeling werkt' };
+
+/**
+ * Blok "E-mail niet verstuurd" voor overzicht en tv-modus. Zonder actieve meldingen: niets (lege string).
+ * Alles uit de payload is onbetrouwbaar en gaat door esc(); links zijn server-side al tot http(s) beperkt.
+ */
+function mailAlertsHtml(items, now, { tv = false } = {}) {
+  if (!items?.length) return '';
+  // Klok van de browser kan afwijken; rekenen met de servertijd van de laatste verversing.
+  const skew = now ? Date.now() / 1000 - now : 0;
+  const nowTs = Date.now() / 1000 - skew;
+  const hhmm = (ts) => new Date(ts * 1000).toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
+  const problems = items.some((a) => a.level === 'crit' || a.level === 'warn');
+  const card = (a) => {
+    const lvl = a.level === 'info' ? 'info' : a.level;
+    const reason = a.level === 'crit' ? (a.diagnose_title || a.error || 'Onbekende fout')
+      : a.level === 'warn' ? `${MAIL_TEXT.warn}${a.diagnose_title ? ` — ${a.diagnose_title}` : ''}` : MAIL_TEXT[a.level];
+    const detail = a.level === 'crit' && a.diagnose_title && a.error ? a.error : a.level === 'info' ? a.error : '';
+    const left = Math.max(0, a.expires_at - nowTs), leftMin = Math.ceil(left / 60);
+    const meta = [
+      a.initiator && esc(a.initiator),
+      a.count > 1 ? `${a.count}× sinds ${hhmm(a.first_at)}` : `om ${hhmm(a.last_at)}`,
+      esc(fmt.ago(a.last_at + skew)),
+      `nog ${left < 60 ? '&lt;1 min' : leftMin >= 120 ? `${Math.round(left / 3600)} uur` : `${leftMin} min`} zichtbaar`,
+    ].filter(Boolean).join(' · ');
+    return `
+      <div class="mail-card lvl-${lvl}">
+        <div class="mail-head"><span class="dot"></span><span class="mail-site" title="${esc(a.site_url)}">${esc(a.site_title)}</span>
+          <span class="badge">${MAIL_LABEL[a.level] || ''}</span></div>
+        ${a.site_host && a.site_host !== a.site_title.toLowerCase() ? `<div class="mail-host">${esc(a.site_host)}</div>` : ''}
+        <ul class="issues"><li class="${a.level === 'crit' ? 'crit' : a.level === 'warn' ? 'warn' : 'info'}">${esc(reason)}</li></ul>
+        ${detail ? `<div class="mail-error">${esc(detail)}</div>` : ''}
+        ${a.subject || a.recipient ? `<div class="mail-msg">${a.subject ? `<b>${esc(a.subject)}</b>` : ''}${a.recipient ? `<span>aan ${esc(a.recipient)}</span>` : ''}</div>` : ''}
+        <div class="mail-meta">${meta}</div>
+        ${!tv && (a.maillog_url || isAdmin()) ? `<div class="mail-actions">
+          ${a.maillog_url ? `<a href="${esc(a.maillog_url)}" target="_blank" rel="noopener noreferrer">Maillog bekijken →</a>` : ''}
+          ${isAdmin() ? `<button type="button" class="btn ghost small" data-dismiss="${+a.id}">Wegklikken</button>` : ''}
+        </div>` : ''}
+      </div>`;
+  };
+  return `
+    <section class="mail-alerts${problems ? ' has-problems' : ''}">
+      <div class="mail-alerts-head">✉ ${problems ? 'E-mail niet verstuurd' : 'E-mailmeldingen'}<span class="count">${items.length}</span></div>
+      <div class="mail-grid">${items.map(card).join('')}</div>
+    </section>`;
 }
 
 function eventsHtml(events, withServer) {
@@ -1427,6 +1489,7 @@ async function renderAdmin() {
     </section>
     <section class="panel" id="notifyPanel"></section>
     <section class="panel" id="rulesPanel"></section>
+    <section class="panel" id="mailHookPanel"></section>
     <section class="panel">
       <h3>Drempelwaarden</h3>
       <form id="thForm" class="form"></form>
@@ -1540,7 +1603,7 @@ async function renderAdmin() {
   }
 
   try {
-    await Promise.all([loadServers(), loadSettings(), drawUsersAdmin($('#usersAdmin'))]);
+    await Promise.all([loadServers(), loadSettings(), drawUsersAdmin($('#usersAdmin')), drawMailHookSettings($('#mailHookPanel'))]);
     setConn(true);
   } catch (e) {
     setConn(false, e.message);

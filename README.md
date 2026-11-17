@@ -37,6 +37,9 @@ Eigen monitoringdashboard voor de Ubuntu/Plesk-servers, de nameserver en de shar
   (instelbaar) een herinnering.
 - **Bereikbaarheid**: het dashboard doet elke minuut een TCP-check op de servers. Zo zie je het verschil tussen "agent
   gestopt" (waarschuwing) en "server onbereikbaar" (kritiek).
+- **E-mailmeldingen (webhook)**: WordPress-sites met NB OC Monitor (direct of via het OC Monitor-paneel) melden e-mail
+  die niet verstuurd kon worden. Zo'n melding staat een instelbare tijd groot op het overzicht en in de tv-modus. Zie
+  [E-mailmeldingen](#e-mailmeldingen).
 - **Tv-modus** (`#/tv`): schermvullend voor op kantoor, met problemen groot in beeld en alle servers compact eronder.
 - **Gebruikers & 2FA**: beheerders en kijkers (alleen lezen), tweestapsverificatie met een authenticator-app.
 - **Beheer**: servers en websites toevoegen, bewerken, pauzeren (onderhoud) en verwijderen; websites automatisch ontdekken
@@ -61,9 +64,11 @@ Elke server krijgt een eigen token; in de database staat alleen de hash daarvan.
 | Gebruikers, sessies, 2FA | `server/auth.js` |
 | Meldingen en incidenten | `server/alerts.js` |
 | Schijfvoorspelling, WordPress-versies | `server/insights.js` |
+| Webhook voor e-mailmeldingen (`/hooks/mail`) | `server/mailhooks.js` |
 | Opslag (ingebouwde `node:sqlite`) | `server/db.js` |
 | Frontend (vanilla JS + uPlot) | `public/` |
 | Demo-simulator | `scripts/simulate.js` |
+| Testmeldingen naar de e-mailwebhook | `scripts/mailhook-test.js` |
 | Externe bewaking van het dashboard | `scripts/watchdog.sh` |
 
 ## Lokaal draaien / demo
@@ -216,6 +221,38 @@ Hij draait met `Nice=10`, idle I/O-prioriteit en een geheugenlimiet van 128 MB.
 - 2FA zet je per gebruiker aan onder **Account** (👤 rechtsboven): scan de QR-code met een authenticator-app.
 - Wachtwoord van de beheerder kwijt? Zet `RESET_ADMIN_PASSWORD=1` in `.env`, herstart, en zet het daarna weer op `0`.
 
+## E-mailmeldingen
+
+De SMTP-logger van NB OC Monitor (WordPress) meldt e-mail die niet verstuurd kon worden aan ServerDash. Alleen weergave:
+er worden geen incidenten aangemaakt en geen meldingen verstuurd.
+
+1. **Beheer → E-mailmeldingen (webhook)** → geef een naam en klik *+ Token aanmaken*. De URL
+   `<PUBLIC_URL>/hooks/mail/<token>` wordt één keer getoond (in de database staat alleen de sha256-hash van het token).
+2. Plak die URL in het OC Monitor-paneel (Instellingen → Meldingen → ServerDash) of rechtstreeks op een site
+   (NB OC Monitor → SMTP → Meldingen → webhook). Een token per paneel of per site; intrekken kan in Beheer.
+3. Kies hoe lang een melding zichtbaar blijft (5 minuten tot 1 dag, standaard 30 minuten). Met *Testmelding tonen*
+   zie je hoe het eruitziet.
+
+| Event | Weergave |
+|---|---|
+| `smtp.failed` | rood blok "E-mail niet verstuurd" |
+| `smtp.backup_used` | oranje: verstuurd via backupverbinding |
+| `smtp.recovered` | wist de rode/oranje melding van die site direct, toont 5 minuten groen "hersteld" |
+| `smtp.test` | neutraal (test van de koppeling) |
+
+Per site (host van `site_url`) en soort is er één melding: een nieuwe melding verhoogt de teller (inclusief
+`suppressed`) en start de weergavetijd opnieuw. Beheerders kunnen een melding op het overzicht wegklikken. Ontvangers
+worden gemaskeerd opgeslagen (`j***@klant.nl`).
+
+Het endpoint: `POST /hooks/mail/<token>` of `POST /hooks/mail` met `Authorization: Bearer <token>`, JSON van maximaal
+32 KB. Antwoorden: `200 {"ok":true}` (ook voor onbekende events, die worden genegeerd), `404` bij een onbekend token,
+`400` ongeldige JSON, `413` te groot, `415` verkeerd Content-Type, `429` bij meer dan 120 verzoeken per minuut per token
+(of te veel onbekende tokens vanaf één IP). Testen tegen een draaiend dashboard:
+
+```bash
+node scripts/mailhook-test.js http://127.0.0.1:8080/hooks/mail/<token> [--recover]
+```
+
 ## Het dashboard zelf bewaken
 
 Als het dashboard uitvalt, krijg je via het dashboard geen meldingen meer. Kies minstens één van deze twee:
@@ -235,6 +272,7 @@ Als het dashboard uitvalt, krijg je via het dashboard geen meldingen meer. Kies 
 - Processnapshots: elke 60 s per server, gecomprimeerd, 72 uur bewaard.
 - Verbruik per abonnement/domein en beveiligingstellers: per uur, 90 dagen.
 - Incidenten en meldingen: 365 dagen.
+- E-mailmeldingen (webhook): een week na het verlopen van de weergavetijd.
 - Wachtwoorden en tokens voor meldingskanalen staan in de database. Zorg dus dat `data/` alleen leesbaar is voor de
   dashboardgebruiker.
 
